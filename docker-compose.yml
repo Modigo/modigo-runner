@@ -1,0 +1,46 @@
+services:
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Match the docker group GID on your host so the runner can access the socket.
+      # Run: stat -c '%g' /var/run/docker.sock   to find the right value.
+      args:
+        DOCKER_GID: "999"
+    image: modigo-runner:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      DOCKER_SOCKET: /var/run/docker.sock
+      IMAGE_PREFIX: modigo-runner-
+      AUTH_SECRET: ${AUTH_SECRET}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-50}
+      EXEC_TIMEOUT: ${EXEC_TIMEOUT:-30s}
+      MAX_MEMORY: ${MAX_MEMORY:-256m}
+      CPU_QUOTA: ${CPU_QUOTA:-50000}
+      MAX_PID: ${MAX_PID:-64}
+      POOL_SIZE: ${POOL_SIZE:-3}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-10}
+      RATE_LIMIT_DAILY: ${RATE_LIMIT_DAILY:-10000}
+    volumes:
+      # Mount host Docker socket so the runner can spawn language containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Limit the runner container's own resources (separate from the code containers it spawns)
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

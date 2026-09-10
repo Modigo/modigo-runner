@@ -1,0 +1,71 @@
+# Caddyfile for Modigo Runner
+# Place this at /etc/caddy/Caddyfile on the VPS
+# Caddy handles TLS automatically — no certbot needed
+
+runner.modigo.com {
+    # Rate limiting — 100 requests per second per IP
+    rate_limit {
+        zone runner_api {
+            key    {remote_host}
+            events 100
+            window 1s
+        }
+    }
+
+    # Proxy to the Go runner
+    reverse_proxy localhost:8080 {
+        # Pass real client IP
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Health check
+        health_uri /health
+        health_interval 10s
+        health_timeout 5s
+
+        # Timeouts
+        transport http {
+            read_timeout 60s
+            write_timeout 60s
+        }
+    }
+
+    # WebSocket support — critical for the runner
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @websocket localhost:8080 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        transport http {
+            read_timeout 0
+            write_timeout 0
+        }
+    }
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+
+    # Logging
+    log {
+        output file /var/log/caddy/runner.log {
+            roll_size 100mb
+            roll_keep 5
+        }
+        format json
+    }
+}
+
+# Health check endpoint (no TLS required for monitoring)
+:8081 {
+    reverse_proxy localhost:8080/health
+}

@@ -1,0 +1,42 @@
+[Unit]
+Description=Modigo Runner - Code Execution Service
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=modigo
+Group=modigo
+
+# Environment
+EnvironmentFile=/etc/modigo-runner/env
+
+# Run the service
+ExecStart=/usr/local/bin/modigo-runner
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp /var/log/modigo-runner
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=modigo-runner
+
+[Install]
+WantedBy=multi-user.target
