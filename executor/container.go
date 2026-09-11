@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -289,7 +291,10 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 		containerCfg.Cmd = []string{"/bin/sh", "/code/" + wrapperName}
 	}
 
-	// Host config: resource limits, network mode, tmpfs for /tmp
+	// Host config: resource limits, network mode, tmpfs for /code and /tmp.
+	// SECURITY (CVE-1): /code is a tmpfs — NOT a host bind-mount. Mounting a host
+	// directory gives a container process a window to replace /code with a symlink
+	// before mount(2) fires (TOCTOU). Using tmpfs + CopyToContainer closes that race.
 	memLimit, cpuPeriod, cpuQuota, pidsLimit := d.limitsForLang(lang)
 	hostCfg := &container.HostConfig{
 		Resources: container.Resources{
@@ -305,10 +310,12 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 		SecurityOpt:    []string{"no-new-privileges"},
 		Mounts: []mount.Mount{
 			{
-				Type:     mount.TypeBind,
-				Source:   codeDir,
-				Target:   "/code",
-				ReadOnly: true,
+				// Writable tmpfs workspace — files are injected below via tar API.
+				Type:   mount.TypeTmpfs,
+				Target: "/code",
+				TmpfsOptions: &mount.TmpfsOptions{
+					SizeBytes: 32 * 1024 * 1024, // 32 MiB is ample for source files
+				},
 			},
 			{
 				Type:   mount.TypeTmpfs,
@@ -337,6 +344,18 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 		return nil, fmt.Errorf("container start: %w", err)
 	}
 
+	// SECURITY (CVE-1 + CVE-2): inject code files via the Docker tar API.
+	// This replaces the former bind-mount and uses no container-side shell or binary,
+	// so neither the symlink race nor PATH-poisoning can affect file delivery.
+	if err := d.copyFilesToContainer(ctx, containerID, codeDir); err != nil {
+		d.Remove(context.Background(), containerID)
+		os.RemoveAll(codeDir)
+		cancel()
+		return nil, fmt.Errorf("copy files to container: %w", err)
+	}
+	// Host staging dir is no longer needed — remove it before the container runs.
+	os.RemoveAll(codeDir)
+
 	// Attach to the container for PTY I/O
 	attachResp, err := d.client.ContainerAttach(ctx, containerID, container.AttachOptions{
 		Stream: true,
@@ -346,7 +365,6 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 	})
 	if err != nil {
 		d.Remove(context.Background(), containerID)
-		os.RemoveAll(codeDir)
 		cancel()
 		return nil, fmt.Errorf("container attach: %w", err)
 	}
@@ -361,7 +379,7 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 		Conn:        attachResp.Conn,
 		Reader:      attachResp.Reader,
 		Cancel:      cancel,
-		TempDir:     codeDir,
+		TempDir:     "", // host dir already removed above
 	}, nil
 }
 
@@ -633,6 +651,8 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 	}
 
 	// Resource limits
+	// SECURITY (CVE-1): /code is a tmpfs, not a host bind-mount, eliminating the
+	// symlink TOCTOU race. Files are pushed in via the Docker tar API below.
 	memLimit := d.limits.Memory
 	pidsLimit := int64(d.limits.PidsLimit)
 	hostCfg := &container.HostConfig{
@@ -648,10 +668,11 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 		ReadonlyRootfs: false,
 		Mounts: []mount.Mount{
 			{
-				Type:     mount.TypeBind,
-				Source:   codeDir,
-				Target:   "/code",
-				ReadOnly: true,
+				Type:   mount.TypeTmpfs,
+				Target: "/code",
+				TmpfsOptions: &mount.TmpfsOptions{
+					SizeBytes: 32 * 1024 * 1024, // 32 MiB
+				},
 			},
 			{
 				Type:   mount.TypeTmpfs,
@@ -672,6 +693,11 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 
 	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 		return nil, fmt.Errorf("container start: %w", err)
+	}
+
+	// Inject code files via tar API (CVE-1 + CVE-2 fix — no shell, no bind-mount).
+	if err := d.copyFilesToContainer(ctx, containerID, codeDir); err != nil {
+		return nil, fmt.Errorf("copy files to container: %w", err)
 	}
 
 	// Attach to pipe stdin
@@ -740,30 +766,54 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 	}, nil
 }
 
-// WriteFileToContainer writes a file into the container's /code/ directory via exec.
+// WriteFileToContainer writes a file into the container's /code/ directory.
+//
+// SECURITY (CVE-2): the former implementation exec'd "/bin/sh -c … | base64 -d > …"
+// inside the container. Because exec resolves binaries from the container PATH, a
+// trojanised image could replace base64 or sh and run arbitrary code with daemon
+// privileges. This version sends a tar archive directly via CopyToContainer — no
+// container-side binary is invoked at all.
 func (d *DockerClient) WriteFileToContainer(ctx context.Context, containerID, path, content string) error {
-	// Sanitize: ensure path is relative and inside /code/
+	// Sanitize: ensure path is relative and contains no traversal components.
 	if strings.Contains(path, "..") {
 		return fmt.Errorf("invalid path: %s", path)
 	}
-	fullPath := "/code/" + path
+	path = strings.TrimPrefix(path, "/")
 
-	// Create parent directory if needed
-	dir := filepath.Dir(fullPath)
-	mkdirCmd := []string{"/bin/sh", "-c", "mkdir -p " + dir}
-	if _, err := d.execQuiet(ctx, containerID, mkdirCmd); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
+	// Build an in-memory tar containing any necessary parent directory entries
+	// followed by the file itself. Docker's extract logic creates missing parents.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	// Emit a directory entry for each path component so the extract always succeeds.
+	dir := filepath.Dir(path)
+	if dir != "." {
+		parts := strings.Split(dir, "/")
+		for i := range parts {
+			_ = tw.WriteHeader(&tar.Header{
+				Name:     strings.Join(parts[:i+1], "/") + "/",
+				Typeflag: tar.TypeDir,
+				Mode:     0755,
+			})
+		}
 	}
 
-	// Write file content via cat with heredoc
-	// Use base64 encoding to avoid shell escaping issues
-	encoded := base64Encode(content)
-	writeCmd := []string{"/bin/sh", "-c", "echo '" + encoded + "' | base64 -d > " + fullPath}
-	if _, err := d.execQuiet(ctx, containerID, writeCmd); err != nil {
-		return fmt.Errorf("write %s: %w", fullPath, err)
+	data := []byte(content)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: path,
+		Mode: 0644,
+		Size: int64(len(data)),
+	}); err != nil {
+		return fmt.Errorf("tar header: %w", err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		return fmt.Errorf("tar write: %w", err)
+	}
+	if err := tw.Close(); err != nil {
+		return err
 	}
 
-	return nil
+	return d.client.CopyToContainer(ctx, containerID, "/code", &buf, dockertypes.CopyToContainerOptions{})
 }
 
 // ReadFilesFromContainer reads all files (and directories) from /code/ and returns them.
@@ -857,6 +907,72 @@ func (d *DockerClient) ReadFilesFromContainer(ctx context.Context, containerID s
 	}
 
 	return files, folders, nil
+}
+
+// copyFilesToContainer stages files on the host (safe tmpdir) and injects them
+// into the container via the Docker tar API. This is the security-critical path
+// referenced by CVE-1/CVE-2: the staging dir is created with os.MkdirTemp,
+// files are written with os.WriteFile, and the tar archive is piped directly
+// to the Docker API without any container-side shell execution.
+func (d *DockerClient) copyFilesToContainer(ctx context.Context, containerID string, codeDir string) error {
+	// Build a tar archive of the code directory.
+	var tmpBuf bytes.Buffer
+	tw := tar.NewWriter(&tmpBuf)
+
+	err := filepath.Walk(codeDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(codeDir, path)
+		if err != nil {
+			return err
+		}
+
+		mode := info.Mode()
+		if mode&0111 != 0 {
+			mode = mode | 0111 // ensure executable bits
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(rel)
+		header.Mode = int64(mode.Perm())
+
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, f); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("tar staging dir: %w", err)
+	}
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("close tar writer: %w", err)
+	}
+
+	// Inject via Docker tar API — no shell, no bind-mount.
+	err = d.client.CopyToContainer(ctx, containerID, "/code",
+		bytes.NewReader(tmpBuf.Bytes()),
+		dockertypes.CopyToContainerOptions{
+			AllowOverwriteDirWithFile: false,
+		},
+	)
+	return err
 }
 
 // execQuiet runs a command in the container and returns stdout as a string.
