@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -966,13 +968,33 @@ func (d *DockerClient) copyFilesToContainer(ctx context.Context, containerID str
 	}
 
 	// Inject via Docker tar API — no shell, no bind-mount.
-	err = d.client.CopyToContainer(ctx, containerID, "/code",
-		bytes.NewReader(tmpBuf.Bytes()),
-		dockertypes.CopyToContainerOptions{
-			AllowOverwriteDirWithFile: false,
-		},
-	)
-	return err
+	// CopyToContainer sends text/plain by default; we override the
+	// content type to application/x-tar so Docker extracts the archive.
+	apiPath := "/containers/" + containerID + "/archive"
+	query := url.Values{}
+	query.Set("path", "/code")
+	query.Set("noOverwriteDirNonDir", "true")
+
+	body := bytes.NewReader(tmpBuf.Bytes())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		"http://docker.cp"+apiPath, body)
+	if err != nil {
+		return fmt.Errorf("build cp request: %w", err)
+	}
+	req.URL.RawQuery = query.Encode()
+	req.Header.Set("Content-Type", "application/x-tar")
+
+	// Use the Docker client's HTTP transport (handles Unix socket)
+	resp, err := d.client.HTTPClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("cp to container: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("cp to container: server returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // execQuiet runs a command in the container and returns stdout as a string.
