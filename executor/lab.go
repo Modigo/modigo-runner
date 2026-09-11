@@ -66,7 +66,8 @@ func NewLabManager(socketPath, imagePrefix string) (*LabManager, error) {
 // Flow:
 //  1. Create Docker network "lab-{sessionID}"
 //  2. Start target container on that network with hostname "target"
-//  3. Return LabSession — caller adds the student container to the network
+//  3. Spawn a background goroutine that kills the lab when timeout elapses
+//  4. Return LabSession — caller adds the student container to the network
 func (lm *LabManager) StartLab(ctx context.Context, sessionID string, target LabTarget, timeout time.Duration) (*LabSession, error) {
 	// 1. Create isolated network
 	networkName := fmt.Sprintf("lab-%s", sessionID)
@@ -82,11 +83,16 @@ func (lm *LabManager) StartLab(ctx context.Context, sessionID string, target Lab
 	}
 	log.Printf("[lab] network %s created (%s)", networkName, netResp.ID[:12])
 
+	// cancelCtx is cancelled when the lab expires or is manually stopped,
+	// whichever comes first.  StopLab calls lab.cancel() to cancel early.
+	labCtx, labCancel := context.WithCancel(context.Background())
+
 	lab := &LabSession{
 		SessionID:      sessionID,
 		NetworkID:      netResp.ID,
 		TargetHostname: "target",
 		ExpiresAt:      time.Now().Add(timeout),
+		cancel:         labCancel,
 	}
 
 	// 2. Start target container
@@ -107,15 +113,16 @@ func (lm *LabManager) StartLab(ctx context.Context, sessionID string, target Lab
 	}
 
 	targetHostCfg := &container.HostConfig{
-		NetworkMode:    container.NetworkMode("default"),
-		Privileged:     false,
-		SecurityOpt:    []string{"no-new-privileges"},
-		RestartPolicy:  container.RestartPolicy{Name: "no"},
-		PortBindings:   nil, // no host port bindings — only accessible within the lab network
+		NetworkMode:   container.NetworkMode("default"),
+		Privileged:    false,
+		SecurityOpt:   []string{"no-new-privileges"},
+		RestartPolicy: container.RestartPolicy{Name: "no"},
+		PortBindings:  nil, // no host port bindings — only accessible within the lab network
 	}
 
 	targetResp, err := lm.client.ContainerCreate(ctx, targetCfg, targetHostCfg, nil, nil, "")
 	if err != nil {
+		labCancel()
 		lm.destroyNetwork(ctx, netResp.ID)
 		return nil, fmt.Errorf("create target container: %w", err)
 	}
@@ -132,18 +139,32 @@ func (lm *LabManager) StartLab(ctx context.Context, sessionID string, target Lab
 	if err := lm.client.NetworkConnect(ctx, netResp.ID, targetResp.ID, &network.EndpointSettings{
 		Aliases: aliases,
 	}); err != nil {
+		labCancel()
 		lm.destroyNetwork(ctx, netResp.ID)
 		return nil, fmt.Errorf("connect target to lab network: %w", err)
 	}
 
 	// Start the target container
 	if err := lm.client.ContainerStart(ctx, targetResp.ID, container.StartOptions{}); err != nil {
+		labCancel()
 		lm.destroyNetwork(ctx, netResp.ID)
 		return nil, fmt.Errorf("start target container: %w", err)
 	}
 
-	log.Printf("[lab] target %s started on network %s (image=%s, port=%d)",
-		targetResp.ID[:12], networkName, targetImage, targetPort)
+	log.Printf("[lab] target %s started on network %s (image=%s, port=%d, expires=%s)",
+		targetResp.ID[:12], networkName, targetImage, targetPort, lab.ExpiresAt.Format(time.RFC3339))
+
+	// 3. Background expiry goroutine — fires when timeout elapses OR when
+	//    StopLab cancels labCtx (whichever comes first).
+	go func() {
+		select {
+		case <-time.After(timeout):
+			log.Printf("[lab] session %s expired after %s — cleaning up", sessionID, timeout)
+			lm.StopLab(context.Background(), lab)
+		case <-labCtx.Done():
+			// Cancelled early by StopLab — cleanup already handled there.
+		}
+	}()
 
 	return lab, nil
 }
@@ -168,9 +189,15 @@ func (lm *LabManager) AddStudentContainer(ctx context.Context, lab *LabSession, 
 }
 
 // StopLab destroys all containers and the network for a lab session.
+// It also cancels the expiry goroutine so it doesn't fire after manual cleanup.
 func (lm *LabManager) StopLab(ctx context.Context, lab *LabSession) {
 	if lab == nil {
 		return
+	}
+
+	// Cancel the expiry goroutine — safe to call multiple times.
+	if lab.cancel != nil {
+		lab.cancel()
 	}
 
 	// Remove student container (caller handles PTY cleanup)
