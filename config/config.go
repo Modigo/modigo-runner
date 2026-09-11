@@ -70,7 +70,7 @@ func Load() *Config {
 		MaxConcurrent:  getEnvInt("MAX_CONCURRENT", 50),
 		RateLimitRPS:   getEnvInt("RATE_LIMIT_RPS", 10),
 		RateLimitDaily: getEnvInt("RATE_LIMIT_DAILY", 10000),
-		AuthSecret:     getEnvStr("AUTH_SECRET", "e229f6ca55830a6741245bb382203c62ab5d9dfb66847bc004b914ed3b97679b"),
+		AuthSecret:     getEnvStr("AUTH_SECRET", ""),
 	}
 	return cfg
 }

@@ -21,6 +21,11 @@ import (
 func main() {
 	cfg := config.Load()
 
+	// Fail fast — never run with no auth secret in production
+	if !cfg.HasAuth() {
+		log.Fatal("FATAL: AUTH_SECRET is not set. Set it in your .env or environment. Refusing to start without auth.")
+	}
+
 	log.Printf("=== Modigo Runner ===")
 	log.Printf("Port:          %d", cfg.Port)
 	log.Printf("Docker Socket: %s", cfg.DockerSocket)

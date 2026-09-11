@@ -1,11 +1,22 @@
 FROM python:3.12-slim
 
-# Remove pip and unnecessary packages to reduce image size
-RUN pip install --no-cache-dir --upgrade pip && \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-install the most commonly needed packages for learning
+RUN pip install --no-cache-dir \
+    # HTTP / web
+    requests httpx flask fastapi uvicorn[standard] \
+    # Data / science
+    numpy pandas matplotlib \
+    # Databases
+    sqlalchemy \
+    # Utilities
+    python-dotenv pydantic click rich \
+    # Testing
+    pytest
 
 WORKDIR /code
 
-# Default command — overridden by the runner service
 CMD ["python", "-u", "/code/main.py"]

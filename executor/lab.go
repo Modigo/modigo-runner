@@ -122,8 +122,15 @@ func (lm *LabManager) StartLab(ctx context.Context, sessionID string, target Lab
 	lab.TargetIDs = append(lab.TargetIDs, targetResp.ID)
 
 	// Connect target to network with DNS alias "target"
+	// Database targets also get the alias "db" so student code can use
+	// standard connection strings like postgres://student:student@db:5432/modigo
+	aliases := []string{"target"}
+	switch strings.ToLower(target.Type) {
+	case "postgres", "postgresql", "mysql":
+		aliases = append(aliases, "db")
+	}
 	if err := lm.client.NetworkConnect(ctx, netResp.ID, targetResp.ID, &network.EndpointSettings{
-		Aliases: []string{"target"},
+		Aliases: aliases,
 	}); err != nil {
 		lm.destroyNetwork(ctx, netResp.ID)
 		return nil, fmt.Errorf("connect target to lab network: %w", err)
@@ -240,6 +247,11 @@ func (lm *LabManager) TargetImage(targetType, override string) string {
 		return lm.imagePrefix + "target-api"
 	case "tcp-server", "tcp":
 		return lm.imagePrefix + "target-tcp"
+	// Database targets
+	case "postgres", "postgresql":
+		return lm.imagePrefix + "target-postgres"
+	case "mysql":
+		return lm.imagePrefix + "target-mysql"
 	default:
 		return lm.imagePrefix + "target-" + targetType
 	}
@@ -257,6 +269,11 @@ func (lm *LabManager) TargetPort(targetType string, override int) int {
 		return 3000
 	case "tcp-server", "tcp":
 		return 9000
+	// Database targets
+	case "postgres", "postgresql":
+		return 5432
+	case "mysql":
+		return 3306
 	default:
 		return 8080
 	}
@@ -267,4 +284,6 @@ var LabTargetImageMap = map[string]int{
 	"vulnerable-web": 80,
 	"vulnerable-api": 3000,
 	"tcp-server":     9000,
+	"postgres":       5432,
+	"mysql":          3306,
 }
