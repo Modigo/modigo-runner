@@ -7,8 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +33,15 @@ type Claims struct {
 	Iat        int64  `json:"iat,omitempty"`
 }
 
+// authFailures counts rejected requests since process start. Surfaced via
+// /health as auth_failures_total so secret drift is observable in monitoring.
+var authFailures atomic.Uint64
+
+// AuthFailures returns the number of auth rejections since process start.
+func AuthFailures() uint64 {
+	return authFailures.Load()
+}
+
 // Middleware validates requests using HMAC-SHA256 JWTs.
 // The shared secret must match AUTH_SECRET on the Laravel side.
 func Middleware(secret string) func(http.Handler) http.Handler {
@@ -45,6 +56,12 @@ func Middleware(secret string) func(http.Handler) http.Handler {
 
 			claims, err := extractClaims(r, secret)
 			if err != nil {
+				// Track and LOG rejections loudly: a burst of invalid-signature
+				// failures almost always means Laravel's RUNNER_SECRET and this
+				// runner's AUTH_SECRET have drifted apart — a total-outage class
+				// of bug that must be visible in ops, not a silent 401.
+				authFailures.Add(1)
+				log.Printf("[auth] REJECTED %s %s from %s: %v | if ALL requests fail like this, RUNNER_SECRET (Laravel) != AUTH_SECRET (runner)", r.Method, r.URL.Path, r.RemoteAddr, err)
 				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnauthorized)
 				return
 			}

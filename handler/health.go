@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/modigo/runner/auth"
 	"github.com/modigo/runner/executor"
 )
 
@@ -52,10 +53,13 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatus)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":      status,
-		"service":     "modigo-runner",
-		"pool_ready":  poolRef != nil && poolRef.IsReady(),
-		"docker":      dockerOK,
+		"status":         status,
+		"service":        "modigo-runner",
+		"pool_ready":     poolRef != nil && poolRef.IsReady(),
+		"docker":         dockerOK,
 		"active_sessions": GetActiveSessions(),
+		// Auth rejections since start. A climbing counter while users report
+		// "WebSocket connection failed" = RUNNER_SECRET/AUTH_SECRET drift.
+		"auth_failures_total": auth.AuthFailures(),
 	})
 }
