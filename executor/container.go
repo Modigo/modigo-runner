@@ -293,10 +293,18 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 		containerCfg.Cmd = []string{"/bin/sh", "/code/" + wrapperName}
 	}
 
-	// Host config: resource limits, network mode, tmpfs for /code and /tmp.
-	// SECURITY (CVE-1): /code is a tmpfs — NOT a host bind-mount. Mounting a host
-	// directory gives a container process a window to replace /code with a symlink
-	// before mount(2) fires (TOCTOU). Using tmpfs + CopyToContainer closes that race.
+	// PHP's image ships an interactive REPL as its default CMD ("php -a"), which
+	// ignores the injected file entirely — override it to run the entry file
+	// (relative path resolves against WorkingDir=/code).
+	if strings.EqualFold(lang, "php") {
+		containerCfg.Cmd = []string{"php", LanguageToMainFile(lang)}
+	}
+
+	// Host config: resource limits, network mode. /code stays in the container
+	// layer (NOT a host bind-mount — that's the security property we care about).
+	// We deliberately avoid a tmpfs /code: Docker's CopyToContainer can fail when
+	// the destination is a bare tmpfs mountpoint with no directory entry, which
+	// broke both file injection and shell-mode writes. /tmp stays tmpfs.
 	memLimit, cpuPeriod, cpuQuota, pidsLimit := d.limitsForLang(lang)
 	hostCfg := &container.HostConfig{
 		Resources: container.Resources{
@@ -311,14 +319,6 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 		AutoRemove:     false,
 		SecurityOpt:    []string{"no-new-privileges"},
 		Mounts: []mount.Mount{
-			{
-				// Writable tmpfs workspace — files are injected below via tar API.
-				Type:   mount.TypeTmpfs,
-				Target: "/code",
-				TmpfsOptions: &mount.TmpfsOptions{
-					SizeBytes: 32 * 1024 * 1024, // 32 MiB is ample for source files
-				},
-			},
 			{
 				Type:   mount.TypeTmpfs,
 				Target: "/tmp",
@@ -338,17 +338,16 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 	}
 	containerID := resp.ID
 
-	// Start the container
-	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		d.Remove(context.Background(), containerID)
-		os.RemoveAll(codeDir)
-		cancel()
-		return nil, fmt.Errorf("container start: %w", err)
-	}
-
-	// SECURITY (CVE-1 + CVE-2): inject code files via the Docker tar API.
-	// This replaces the former bind-mount and uses no container-side shell or binary,
-	// so neither the symlink race nor PATH-poisoning can affect file delivery.
+	// SECURITY (CVE-1 + CVE-2): inject code files via the Docker tar API BEFORE the
+	// container starts. This replaces the former bind-mount and uses no
+	// container-side shell or binary, so neither the symlink race nor
+	// PATH-poisoning can affect file delivery.
+	//
+	// Order is critical: language images ship a default CMD (e.g.
+	// ["python","-u","/code/main.py"]) that begins executing the moment the
+	// container starts. Injecting after ContainerStart races that entrypoint —
+	// the process can boot against an empty /code ("can't open file
+	// '/code/main.py'"). Create → copy → start has no race.
 	if err := d.copyFilesToContainer(ctx, containerID, codeDir); err != nil {
 		d.Remove(context.Background(), containerID)
 		os.RemoveAll(codeDir)
@@ -357,6 +356,13 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 	}
 	// Host staging dir is no longer needed — remove it before the container runs.
 	os.RemoveAll(codeDir)
+
+	// Start the container
+	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		d.Remove(context.Background(), containerID)
+		cancel()
+		return nil, fmt.Errorf("container start: %w", err)
+	}
 
 	// Attach to the container for PTY I/O
 	attachResp, err := d.client.ContainerAttach(ctx, containerID, container.AttachOptions{
@@ -508,7 +514,10 @@ HISTCONTROL=ignoredups
 		},
 	}
 
-	// Host config: resource limits, no network (unless lab), writable /code via tmpfs
+	// Host config: resource limits, no network (unless lab). /code stays in the
+	// container layer — the "write" message handler and file-sync both use
+	// CopyToContainer, which fails against a bare tmpfs mountpoint. Not being a
+	// host bind-mount is the security property that matters (no host fs exposure).
 	memLimit, cpuPeriod, cpuQuota, pidsLimit := d.limitsForLang(lang)
 	networkMode := "none"
 	if labNetworkID != "" {
@@ -532,14 +541,6 @@ HISTCONTROL=ignoredups
 				Target: "/tmp",
 				TmpfsOptions: &mount.TmpfsOptions{
 					Options: [][]string{{"exec"}},
-				},
-			},
-			{
-				Type:   mount.TypeTmpfs,
-				Target: "/code",
-				TmpfsOptions: &mount.TmpfsOptions{
-					SizeBytes: 64 * 1024 * 1024, // 64 MiB writable workspace
-					Options:   [][]string{{"exec"}},
 				},
 			},
 		},
@@ -652,9 +653,16 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 		containerCfg.Cmd = []string{"/bin/sh", "/code/" + filepath.Base(wrapperPath)}
 	}
 
+	// PHP's image ships an interactive REPL as its default CMD ("php -a"), which
+	// ignores the provided file entirely — override it to run the entry file.
+	if strings.EqualFold(req.Language, "php") {
+		containerCfg.Cmd = []string{"php", mainFile}
+	}
+
 	// Resource limits
-	// SECURITY (CVE-1): /code is a tmpfs, not a host bind-mount, eliminating the
-	// symlink TOCTOU race. Files are pushed in via the Docker tar API below.
+	// SECURITY (CVE-1): /code is NOT a host bind-mount (files go in via the tar
+	// API below). We keep it in the container layer rather than tmpfs — see the
+	// note in CreateInteractive.
 	memLimit := d.limits.Memory
 	pidsLimit := int64(d.limits.PidsLimit)
 	hostCfg := &container.HostConfig{
@@ -669,13 +677,6 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 		SecurityOpt:    []string{"no-new-privileges"},
 		ReadonlyRootfs: false,
 		Mounts: []mount.Mount{
-			{
-				Type:   mount.TypeTmpfs,
-				Target: "/code",
-				TmpfsOptions: &mount.TmpfsOptions{
-					SizeBytes: 32 * 1024 * 1024, // 32 MiB
-				},
-			},
 			{
 				Type:   mount.TypeTmpfs,
 				Target: "/tmp",
@@ -693,13 +694,15 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 	containerID := resp.ID
 	defer d.Remove(context.Background(), containerID)
 
-	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return nil, fmt.Errorf("container start: %w", err)
-	}
-
-	// Inject code files via tar API (CVE-1 + CVE-2 fix — no shell, no bind-mount).
+	// Inject code files via tar API BEFORE start (CVE-1 + CVE-2 fix — no shell,
+	// no bind-mount). The image entrypoint may run user code immediately, so the
+	// files must already be in place when the container starts.
 	if err := d.copyFilesToContainer(ctx, containerID, codeDir); err != nil {
 		return nil, fmt.Errorf("copy files to container: %w", err)
+	}
+
+	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		return nil, fmt.Errorf("container start: %w", err)
 	}
 
 	// Attach to pipe stdin

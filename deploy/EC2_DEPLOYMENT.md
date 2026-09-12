@@ -376,6 +376,36 @@ sudo systemctl restart modigo-runner
 - Check the domain resolves to your EC2 IP: `dig runner.modigo.online`
 - Check port 443 is open in your EC2 security group
 
+**WebSocket handshake rejected (401/403) even though /health works**
+
+The browser shows a generic "connection failed" error for both auth and origin
+rejections, so check the server log to see the real cause:
+
+```bash
+sudo journalctl -u modigo-runner -n 200 --no-pager | grep -E "rejected origin|\[ws\]|auth"
+```
+
+- `401 invalid token signature` → `AUTH_SECRET` (in `/etc/modigo-runner/env`)
+  does not match `RUNNER_SECRET` in the Laravel `.env`. They must be
+  byte-identical.
+- `[ws] rejected origin: ...` → the page's origin is not in `ALLOWED_ORIGINS`.
+  This happens when testing from localhost or a Vercel preview URL — add the
+  origin (e.g. `http://localhost:5173`), then `sudo systemctl restart modigo-runner`.
+
+To test the full handshake path with a real token (from `/api/runner/token`
+in the browser Network tab), force HTTP/1.1 — WebSocket upgrades do not exist
+over HTTP/2:
+
+```bash
+curl -m 5 -i -N --http1.1 \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Sec-WebSocket-Version: 13" \
+  -H "Origin: https://modigo.online" \
+  -H "Sec-WebSocket-Protocol: <PASTE_TOKEN_HERE>" \
+  https://runner.modigo.online/ws/run
+# Expect: HTTP/1.1 101 Switching Protocols
+```
+
 **Language image not found**
 ```bash
 docker images | grep modigo-runner
