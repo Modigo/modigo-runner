@@ -236,6 +236,11 @@ func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient,
 		case "read_files":
 			handleReadFilesMessage(conn, docker, st)
 
+		case "ping":
+			// Client keepalive. Intermediaries (Cloudflare) drop idle WebSocket
+			// paths after ~100s; a lightweight reply keeps the path alive.
+			sendMessage(conn, protocol.ServerMessage{Type: "pong"})
+
 		default:
 			sendError(conn, "Unknown message type: "+msg.Type)
 		}

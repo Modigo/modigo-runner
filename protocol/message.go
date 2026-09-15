@@ -2,7 +2,7 @@ package protocol
 
 // ClientMessage is the JSON structure sent from client (browser) to server.
 type ClientMessage struct {
-	Type     string `json:"type"`                // "run" | "input" | "resize" | "write" | "read_files"
+	Type     string `json:"type"`                // "run" | "input" | "resize" | "write" | "read_files" | "ping"
 	Language string `json:"language,omitempty"`   // "python" | "javascript"
 	Code     string `json:"code,omitempty"`       // source code to execute
 	Stdin    string `json:"stdin,omitempty"`      // pre-supplied stdin (REST mode compat)
