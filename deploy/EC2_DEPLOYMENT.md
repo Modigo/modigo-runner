@@ -15,6 +15,31 @@ Complete guide for deploying the modigo-runner on AWS EC2.
 
 Keep port 8080 closed publicly — Caddy proxies to it from 443.
 
+### Capacity planning (measured, not guessed)
+
+Load-tested with `loadtest/loadtest.mjs` (bursty classroom runs + shells):
+
+| Box | MAX_CONCURRENT | MAX_MEMORY | Carries |
+|---|---|---|---|
+| 2 vCPU / 4GB | 6 | 384m | ~10–15 connected users |
+| 2 vCPU / 8GB (t3.large) | **12** | **384m** | **~40–60 connected users** |
+| 4 vCPU / 16GB (t3.xlarge) | 25 | 384m | ~100 connected users |
+
+CPU is the binding constraint on every tier: each running container takes
+CPU_QUOTA/100000 of a core, so on 2 cores a burst of 12 simultaneous runs
+saturates the box. Beyond MAX_CONCURRENT, requests queue briefly and fail
+fast with a clean "at capacity" message (semaphore deadline) — users retry
+automatically; nothing hangs, no Cloudflare 524s.
+
+For assessment spikes (every student clicks Run at once), prefer 2+ boxes
+behind a Cloudflare Load Balancer over one giant instance: the runner is
+stateless per request, so origin-pool scaling is safe.
+
+Bugs fixed under load (ship ≥ this version): per-connection WebSocket write
+mutex (concurrent-write panic killed whole sessions) and per-user run
+container eviction (zombie containers from Stop/refresh permanently locked
+users out at the 3-container cap).
+
 ---
 
 ## Part 1 — EC2 Security Group
