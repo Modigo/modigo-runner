@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -62,7 +63,35 @@ var (
 	// userContainers tracks active container count per user for per-user limits.
 	userContainers   = make(map[string]int)
 	userContainersMu sync.Mutex
+
+	// userRuns tracks the user's live RUN container IDs with creation times
+	// (unix ms) so the oldest can be evicted when the per-user cap is hit.
+	// Only run containers are tracked — shells are replaced, not accumulated.
+	userRuns   = make(map[string]map[string]int64)
+	userRunsMu sync.Mutex
 )
+
+// trackUserRun records a run container for a user.
+func trackUserRun(userID, containerID string) {
+	userRunsMu.Lock()
+	defer userRunsMu.Unlock()
+	if userRuns[userID] == nil {
+		userRuns[userID] = make(map[string]int64)
+	}
+	userRuns[userID][containerID] = time.Now().UnixMilli()
+}
+
+// deleteUserRun forgets a run container (on natural exit or eviction).
+func deleteUserRun(userID, containerID string) {
+	userRunsMu.Lock()
+	defer userRunsMu.Unlock()
+	if m := userRuns[userID]; m != nil {
+		delete(m, containerID)
+		if len(m) == 0 {
+			delete(userRuns, userID)
+		}
+	}
+}
 
 // MaxContainersPerUser is the maximum concurrent containers a single user can have.
 const MaxContainersPerUser = 3
@@ -76,6 +105,60 @@ func incUserContainers(userID string) bool {
 	}
 	userContainers[userID]++
 	return true
+}
+
+// evictOldestUserContainer forcibly kills the user's oldest tracked container
+// (if any) and decrements their count. Returns the container ID evicted, or "".
+//
+// Why: the per-user count previously only dropped when the owning WebSocket
+// closed. A client that hits Stop / refreshes mid-run (or a load-test client
+// that times out) leaves the run container alive server-side, and the user
+// racks up zombie containers until every new run is rejected with "max 3 per
+// user" — a permanent lockout until they fully reconnect. Evicting the oldest
+// run container on a fresh run request makes the limit self-healing, which is
+// the behavior users expect: your newest action always wins.
+func evictOldestUserContainer(docker *executor.DockerClient, userID string) string {
+	userContainersMu.Lock()
+	if userContainers[userID] < MaxContainersPerUser {
+		userContainersMu.Unlock()
+		return "" // under the cap — nothing to do
+	}
+	userContainersMu.Unlock()
+
+	userRunsMu.Lock()
+	ids := make([]string, 0, len(userRuns[userID]))
+	for cid := range userRuns[userID] {
+		ids = append(ids, cid)
+	}
+	userRunsMu.Unlock()
+
+	if len(ids) == 0 {
+		// Count is at cap but no tracked runs (e.g. leaked count from a
+		// pre-restart process). Nothing to evict; caller will fail.
+		return ""
+	}
+
+	// Oldest by creation time recorded in userRuns.
+	oldest := ""
+	var oldestTime int64 = math.MaxInt64
+	userRunsMu.Lock()
+	for cid, ts := range userRuns[userID] {
+		if ts < oldestTime {
+			oldestTime = ts
+			oldest = cid
+		}
+	}
+	userRunsMu.Unlock()
+
+	if oldest == "" {
+		return ""
+	}
+
+	log.Printf("[ws] evicting oldest container %s for user=%s (cap reached)", oldest, userID)
+	docker.Remove(context.Background(), oldest)
+	deleteUserRun(userID, oldest)
+	decUserContainers(userID)
+	return oldest
 }
 
 // decUserContainers decrements the container count for a user.
@@ -374,10 +457,15 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 		return
 	}
 
-	// Check per-user container limit
+	// Check per-user container limit — evict the user's oldest run container
+	// when at cap so a stopped/refreshed client's zombie containers can never
+	// permanently lock them out. Newest action wins.
 	if !incUserContainers(st.userID) {
-		sendError(conn, fmt.Sprintf("Too many concurrent programs (max %d per user). Close other tabs or wait for a run to finish.", MaxContainersPerUser))
-		return
+		evictOldestUserContainer(docker, st.userID)
+		if !incUserContainers(st.userID) {
+			sendError(conn, fmt.Sprintf("Too many concurrent programs (max %d per user). Close other tabs or wait for a run to finish.", MaxContainersPerUser))
+			return
+		}
 	}
 
 	// Clean up any existing session
@@ -451,6 +539,11 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 	st.session = sess
 	st.tempDir = sess.TempDir
 	st.mu.Unlock()
+
+	// Track this run container for per-user eviction (oldest dies when the
+	// user's cap is hit by a newer run).
+	trackUserRun(st.userID, sess.ContainerID)
+	defer deleteUserRun(st.userID, sess.ContainerID)
 
 	// Send started message
 	sendMessage(conn, protocol.ServerMessage{Type: "started"})
@@ -839,7 +932,18 @@ func TriggerShutdown(docker *executor.DockerClient) {
 	})
 }
 
+// connWriteMu serializes ALL writes to a WebSocket connection.
+//
+// gorilla/websocket forbids concurrent writers: multiple goroutines call
+// sendMessage on the same conn (the main message loop sending errors/acks,
+// the run output bridge, the shell output bridge, and exit notifications).
+// Without this mutex, two simultaneous writes panic "concurrent write to
+// websocket connection" — under load this was killing whole sessions.
+var connWriteMu sync.Mutex
+
 func sendMessage(conn *websocket.Conn, msg protocol.ServerMessage) {
+	connWriteMu.Lock()
+	defer connWriteMu.Unlock()
 	conn.WriteJSON(msg)
 }
 
