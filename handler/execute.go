@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/modigo/runner/auth"
 	"github.com/modigo/runner/executor"
@@ -56,8 +58,17 @@ func Execute(docker *executor.DockerClient, limiter *ratelimit.Limiter, sem *exe
 			return
 		}
 
-		// Acquire concurrency slot — blocks if at capacity
-		sem.Acquire()
+		// Acquire concurrency slot — bounded wait. Cloudflare 524s any HTTP
+		// request without a response after ~100s; queueing past that point
+		// just turns overload into cryptic edge errors. Fail fast with 503
+		// (which passes through Cloudflare untouched) and let clients retry.
+		acquireCtx, cancelAcquire := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancelAcquire()
+		if !sem.AcquireContext(acquireCtx) {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, `{"error":"Service at capacity — try again shortly"}`, http.StatusServiceUnavailable)
+			return
+		}
 		defer sem.Release()
 
 		plan := auth.GetPlan(r)

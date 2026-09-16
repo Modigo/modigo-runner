@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,42 @@ func TestSemaphore_BasicAcquireRelease(t *testing.T) {
 	if sem.Available() != 1 {
 		t.Fatalf("expected 1 available after release, got %d", sem.Available())
 	}
+}
+
+func TestSemaphore_AcquireContext_deadline(t *testing.T) {
+	sem := NewSemaphore(1)
+	sem.Acquire() // fill the only slot
+
+	// At capacity: a bounded acquire must return false after the deadline,
+	// not block forever (Cloudflare 524 protection).
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if got := sem.AcquireContext(ctx); got {
+		t.Fatal("expected AcquireContext to fail at capacity after deadline")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("AcquireContext waited too long: %v", elapsed)
+	}
+
+	// Free the slot, then the acquire must succeed immediately.
+	sem.Release()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel2()
+	if !sem.AcquireContext(ctx2) {
+		t.Fatal("expected AcquireContext to succeed when a slot is free")
+	}
+	sem.Release()
+
+	// A cancelled context must abort even while waiting.
+	sem.Acquire()
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	cancel3()
+	if got := sem.AcquireContext(ctx3); got {
+		sem.Release()
+		t.Fatal("expected AcquireContext to fail on a cancelled context")
+	}
+	sem.Release()
 }
 
 func TestSemaphore_blocksAtCapacity(t *testing.T) {

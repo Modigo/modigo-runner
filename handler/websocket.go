@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -115,6 +116,16 @@ type sessionState struct {
 // Auth is already handled by the middleware — this just upgrades and runs.
 func WebSocketHandler(docker *executor.DockerClient, cfg *config.Config, sem *executor.Semaphore, labMgr *executor.LabManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Panic isolation: a panic in any per-connection path (malformed
+		// message, race in pool/container code, etc.) used to unwind past the
+		// goroutine root and kill the ENTIRE process — disconnecting every
+		// connected user at once. Contain it to this connection instead.
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[ws] PANIC in websocket session (recovered, connection closed): %v\n%s", rec, debug.Stack())
+			}
+		}()
+
 		// Reject connections during shutdown
 		select {
 		case <-shutdownCh:
@@ -393,8 +404,15 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 
 	log.Printf("[ws] run: lang=%s code_len=%d gen=%d lab=%v user=%s", msg.Language, len(code), currentGen, labNetworkID != "", st.userID)
 
-	// Acquire concurrency slot — blocks if at capacity
-	sem.Acquire()
+	// Acquire concurrency slot — bounded wait so queued runs fail fast with
+	// a clear message instead of hanging the connection while at capacity.
+	acquireCtx, cancelAcquire := context.WithTimeout(context.Background(), 45*time.Second)
+	if !sem.AcquireContext(acquireCtx) {
+		cancelAcquire()
+		sendError(conn, "Service is at capacity right now — please try again in a moment.")
+		return
+	}
+	defer cancelAcquire()
 
 	// Create container — use context.Background() (no timeout context).
 	// The Docker attach connection (hijacked socket) references the context; cancelling
@@ -714,8 +732,14 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 
 	log.Printf("[ws] shell: lang=%s gen=%d lab=%v", lang, currentGen, labNetworkID != "")
 
-	// Acquire concurrency slot
-	sem.Acquire()
+	// Acquire concurrency slot — bounded wait (see run path comment).
+	shellAcquireCtx, cancelShellAcquire := context.WithTimeout(context.Background(), 45*time.Second)
+	if !sem.AcquireContext(shellAcquireCtx) {
+		cancelShellAcquire()
+		sendError(conn, "Service is at capacity right now — please try again in a moment.")
+		return
+	}
+	defer cancelShellAcquire()
 
 	sess, err := docker.CreateShell(context.Background(), lang, labNetworkID)
 	if err != nil {
