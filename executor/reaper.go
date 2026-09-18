@@ -1,12 +1,8 @@
 package executor
 
 import (
-	"context"
 	"log"
 	"time"
-
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
 )
 
 // zombieReapInterval is how often the background reaper scans for leaked containers.
@@ -33,46 +29,8 @@ func StartZombieReaper(docker *DockerClient) {
 		ticker := time.NewTicker(zombieReapInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			reapZombieContainers(docker, zombieMaxAge)
+			cleanupAged(docker, zombieMaxAge, "reaper")
 		}
 	}()
 	log.Printf("[reaper] zombie container reaper started (interval %s, max age %s)", zombieReapInterval, zombieMaxAge)
-}
-
-// reapZombieContainers removes modigo-runner containers older than maxAge.
-// A container that old cannot be legitimate: every path that creates one
-// arms a kill timer well below this threshold.
-func reapZombieContainers(docker *DockerClient, maxAge time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	filterArgs := filters.NewArgs()
-	filterArgs.Add("label", "modigo-runner")
-
-	containers, err := docker.client.ContainerList(ctx, container.ListOptions{
-		All:     true,
-		Filters: filterArgs,
-	})
-	if err != nil {
-		log.Printf("[reaper] failed to list containers: %v", err)
-		return
-	}
-
-	removed := 0
-	for _, c := range containers {
-		created := time.Unix(c.Created, 0)
-		if time.Since(created) < maxAge {
-			continue
-		}
-		id := c.ID
-		if len(id) > 12 {
-			id = id[:12]
-		}
-		log.Printf("[reaper] removing leaked container %s (age %s exceeds max %s)", id, time.Since(created).Round(time.Second), maxAge)
-		docker.Remove(ctx, c.ID)
-		removed++
-	}
-	if removed > 0 {
-		log.Printf("[reaper] removed %d leaked container(s)", removed)
-	}
 }
