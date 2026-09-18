@@ -285,6 +285,7 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 			"PS2=",
 			"TERM=xterm-256color",
 		},
+		Labels: map[string]string{"modigo-runner": "1"},
 	}
 
 	// If we have a wrapper (compiled language), override the command
@@ -512,6 +513,7 @@ HISTCONTROL=ignoredups
 			"LC_ALL=C.UTF-8",
 			"HOME=/code",
 		},
+		Labels: map[string]string{"modigo-runner": "1"},
 	}
 
 	// Host config: resource limits, no network (unless lab). /code stays in the
@@ -642,6 +644,7 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
+		Labels:       map[string]string{"modigo-runner": "1"},
 	}
 
 	// For compiled languages, add a compile+run wrapper

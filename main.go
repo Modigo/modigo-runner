@@ -52,6 +52,10 @@ func main() {
 	// Clean up orphaned containers from previous crashes
 	executor.CleanupOrphanedContainers(docker)
 
+	// Background reaper: force-remove leaked containers every 5 min so a crash
+	// or missed in-band timeout can never pin concurrency slots for good.
+	executor.StartZombieReaper(docker)
+
 	// Initialize lab manager for isolated student↔target networking
 	labMgr, labErr := executor.NewLabManager(cfg.DockerSocket, cfg.ImagePrefix)
 	if labErr != nil {
@@ -65,14 +69,15 @@ func main() {
 	containerSem := executor.NewSemaphore(cfg.MaxConcurrent)
 
 	// Initialize rate limiter
-	limiter := ratelimit.NewLimiter(cfg.RateLimitRPS, cfg.RateLimitDaily)    // Pre-warm container pool
-    supportedLangs := []string{"python", "javascript", "c", "cpp", "go", "java", "rust", "php", "cyber"}
+	limiter := ratelimit.NewLimiter(cfg.RateLimitRPS, cfg.RateLimitDaily) // Pre-warm container pool
+	supportedLangs := []string{"python", "javascript", "c", "cpp", "go", "java", "rust", "php", "cyber"}
 	pool := executor.NewPool(docker, cfg.PoolSize, supportedLangs)
 	defer pool.Stop()
 
 	// Wire pool reference for health checks
 	handler.SetPool(pool)
 	handler.SetDockerClient(docker)
+	handler.SetSemaphore(containerSem)
 
 	// Auth middleware — validates JWTs signed by Laravel
 	authMw := auth.Middleware(cfg.AuthSecret)

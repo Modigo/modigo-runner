@@ -7,10 +7,12 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -95,6 +97,20 @@ func deleteUserRun(userID, containerID string) {
 
 // MaxContainersPerUser is the maximum concurrent containers a single user can have.
 const MaxContainersPerUser = 3
+
+// wsReadTimeout is the server-side read deadline for WebSocket connections.
+// Every inbound client message (the heartbeat pings every 25s) resets it.
+// A client that vanishes without a TCP close (laptop sleep, Wi-Fi drop, NAT
+// timeout) previously held its session AND its Docker container/slot forever —
+// the root cause of "at capacity" with only a handful of real users. After
+// 90s (~3 missed pings) the session is reaped and its resources released.
+const wsReadTimeout = 90 * time.Second
+
+// shellIdleTimeout is how long an interactive shell container may sit without
+// any user input before it is killed and its concurrency slot released.
+// Shell containers previously had NO timeout: an idle browser tab holding a
+// shell pinned a Docker container + semaphore slot until the tab closed.
+const shellIdleTimeout = 10 * time.Minute
 
 // incUserContainers increments the container count for a user. Returns false if limit exceeded.
 func incUserContainers(userID string) bool {
@@ -186,13 +202,14 @@ func GetActiveSessions() int64 {
 
 // sessionState holds the mutable state for a single WebSocket session.
 type sessionState struct {
-	mu         sync.Mutex
-	session    *executor.InteractiveSession
-	generation uint64               // incremented on each new "run" — prevents stale goroutines from killing new sessions
-	tempDir    string               // code directory to clean up
-	lab        *executor.LabSession // active lab session (nil if no lab)
-	userID     string               // authenticated user ID for per-user limits
-	timedOut   bool                 // true if the last run was killed by timeout
+	mu                sync.Mutex
+	session           *executor.InteractiveSession
+	generation        uint64               // incremented on each new "run" — prevents stale goroutines from killing new sessions
+	tempDir           string               // code directory to clean up
+	lab               *executor.LabSession // active lab session (nil if no lab)
+	userID            string               // authenticated user ID for per-user limits
+	timedOut          bool                 // true if the last run was killed by timeout
+	shellLastActivity int64                // unix nano of last shell input — drives the shell idle reaper
 }
 
 // WebSocketHandler handles WS connections for interactive terminal sessions.
@@ -236,6 +253,14 @@ func WebSocketHandler(docker *executor.DockerClient, cfg *config.Config, sem *ex
 			return
 		}
 		defer conn.Close()
+
+		// Server-side liveness: every client message (heartbeat pings every 25s)
+		// resets this deadline. If nothing arrives within 90s the connection is
+		// half-open (client vanished — sleep/Wi-Fi drop/NAT timeout) and the
+		// session — including its Docker container and concurrency slot — must be
+		// reaped. Without this, dead connections accumulated as "active sessions"
+		// and exhausted MAX_CONCURRENT with only a handful of real users.
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 
 		// Track active sessions
 		activeSessionsMu.Lock()
@@ -295,9 +320,16 @@ func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient,
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				log.Printf("[ws] read error: %v", err)
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[ws] idle timeout — reaping dead session (user=%s)", userID)
+			} else {
+				log.Printf("[ws] session ended: %v", err)
 			}
 			return
 		}
+
+		// Any inbound message proves the client is alive — extend the deadline.
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 
 		var msg protocol.ClientMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
@@ -494,9 +526,14 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 
 	// Acquire concurrency slot — bounded wait so queued runs fail fast with
 	// a clear message instead of hanging the connection while at capacity.
+	// On failure the per-user count MUST be decremented: it was incremented
+	// before the acquire attempt, and without this the 3-attempt "max per user"
+	// budget silently burns down on repeated capacity rejections, locking the
+	// user out until the process restarts.
 	acquireCtx, cancelAcquire := context.WithTimeout(context.Background(), 45*time.Second)
 	if !sem.AcquireContext(acquireCtx) {
 		cancelAcquire()
+		decUserContainers(st.userID)
 		sendError(conn, "Service is at capacity right now — please try again in a moment.")
 		return
 	}
@@ -702,6 +739,9 @@ func handleInputMessage(st *sessionState, msg protocol.ClientMessage) {
 		return
 	}
 
+	// Any user input keeps an interactive shell alive — reset the idle reaper.
+	atomic.StoreInt64(&st.shellLastActivity, time.Now().UnixNano())
+
 	if err := writeAll(s.Conn, []byte(msg.Data)); err != nil {
 		log.Printf("[ws] container write error: %v", err)
 	}
@@ -846,6 +886,29 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 	st.session = sess
 	st.mu.Unlock()
 
+	// Shell idle reaper: shells previously ran forever — an idle browser tab
+	// pinned a Docker container + semaphore slot until the tab closed. If the
+	// user sends no input for shellIdleTimeout, kill the shell and free the slot.
+	atomic.StoreInt64(&st.shellLastActivity, time.Now().UnixNano())
+	shellIdleTimer := time.AfterFunc(shellIdleTimeout, func() {
+		st.mu.Lock()
+		s := st.session
+		gen := st.generation
+		last := atomic.LoadInt64(&st.shellLastActivity)
+		st.mu.Unlock()
+
+		// Still current generation and genuinely idle since arming?
+		if s == nil || gen != currentGen || time.Since(time.Unix(0, last)) < shellIdleTimeout {
+			return
+		}
+		log.Printf("[ws] shell idle for %s, killing container (gen=%d)", shellIdleTimeout, gen)
+		sendMessage(conn, protocol.ServerMessage{
+			Type: "output",
+			Data: "\r\n\x1b[33m[Shell closed after 10 minutes of inactivity — press Enter to reconnect]\x1b[0m\r\n",
+		})
+		s.Cancel()
+	})
+
 	// Send started message
 	sendMessage(conn, protocol.ServerMessage{Type: "started"})
 
@@ -853,6 +916,7 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 	outputDone := make(chan struct{})
 	go func() {
 		defer close(outputDone)
+		defer shellIdleTimer.Stop()
 		buf := make([]byte, 4096)
 		for {
 			n, readErr := sess.Reader.Read(buf)
