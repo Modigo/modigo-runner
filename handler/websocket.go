@@ -203,6 +203,7 @@ func GetActiveSessions() int64 {
 // sessionState holds the mutable state for a single WebSocket session.
 type sessionState struct {
 	mu                sync.Mutex
+	writeMu           sync.Mutex           // serializes writes to the WebSocket connection
 	session           *executor.InteractiveSession
 	generation        uint64               // incremented on each new "run" — prevents stale goroutines from killing new sessions
 	tempDir           string               // code directory to clean up
@@ -333,7 +334,7 @@ func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient,
 
 		var msg protocol.ClientMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
-			sendError(conn, "Invalid message format")
+			st.sendError(conn, "Invalid message format")
 			continue
 		}
 
@@ -365,10 +366,10 @@ func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient,
 		case "ping":
 			// Client keepalive. Intermediaries (Cloudflare) drop idle WebSocket
 			// paths after ~100s; a lightweight reply keeps the path alive.
-			sendMessage(conn, protocol.ServerMessage{Type: "pong"})
+			st.sendMessage(conn, protocol.ServerMessage{Type: "pong"})
 
 		default:
-			sendError(conn, "Unknown message type: "+msg.Type)
+			st.sendError(conn, "Unknown message type: "+msg.Type)
 		}
 	}
 }
@@ -377,7 +378,7 @@ func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient,
 // The student's next "run" message will create their code container on the lab network.
 func handleLabStart(conn *websocket.Conn, docker *executor.DockerClient, cfg *config.Config, st *sessionState, msg *protocol.ClientMessage, labMgr *executor.LabManager) {
 	if labMgr == nil {
-		sendError(conn, "Lab mode not available")
+		st.sendError(conn, "Lab mode not available")
 		return
 	}
 
@@ -390,7 +391,7 @@ func handleLabStart(conn *websocket.Conn, docker *executor.DockerClient, cfg *co
 	st.mu.Unlock()
 
 	if msg.Lab == nil {
-		sendError(conn, "lab config is required for lab_start")
+		st.sendError(conn, "lab config is required for lab_start")
 		return
 	}
 
@@ -420,7 +421,7 @@ func handleLabStart(conn *websocket.Conn, docker *executor.DockerClient, cfg *co
 
 	if err != nil {
 		log.Printf("[ws] lab start failed: %v", err)
-		sendError(conn, "Failed to start lab: "+err.Error())
+		st.sendError(conn, "Failed to start lab: "+err.Error())
 		return
 	}
 
@@ -434,7 +435,7 @@ func handleLabStart(conn *websocket.Conn, docker *executor.DockerClient, cfg *co
 	targetURL := fmt.Sprintf("http://target:%d", targetPort)
 
 	// Send lab info to client
-	sendMessage(conn, protocol.ServerMessage{
+	st.sendMessage(conn, protocol.ServerMessage{
 		Type: "lab_started",
 		LabInfo: &protocol.LabInfo{
 			TargetURL:  targetURL,
@@ -454,7 +455,7 @@ func handleLabStop(conn *websocket.Conn, st *sessionState, labMgr *executor.LabM
 	st.mu.Unlock()
 
 	if lab == nil {
-		sendError(conn, "No active lab session")
+		st.sendError(conn, "No active lab session")
 		return
 	}
 
@@ -462,7 +463,7 @@ func handleLabStop(conn *websocket.Conn, st *sessionState, labMgr *executor.LabM
 		labMgr.StopLab(context.Background(), lab)
 	}
 
-	sendMessage(conn, protocol.ServerMessage{
+	st.sendMessage(conn, protocol.ServerMessage{
 		Type:    "lab_stopped",
 		Message: "Lab session ended",
 	})
@@ -474,7 +475,7 @@ func handleLabStop(conn *websocket.Conn, st *sessionState, labMgr *executor.LabM
 func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *config.Config, st *sessionState, msg *protocol.ClientMessage, sem *executor.Semaphore, labMgr *executor.LabManager) {
 	// Validate
 	if msg.Language == "" {
-		sendError(conn, "language is required")
+		st.sendError(conn, "language is required")
 		return
 	}
 
@@ -485,7 +486,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 		code = msg.Files[0].Content
 	}
 	if code == "" {
-		sendError(conn, "code or files is required")
+		st.sendError(conn, "code or files is required")
 		return
 	}
 
@@ -495,7 +496,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 	if !incUserContainers(st.userID) {
 		evictOldestUserContainer(docker, st.userID)
 		if !incUserContainers(st.userID) {
-			sendError(conn, fmt.Sprintf("Too many concurrent programs (max %d per user). Close other tabs or wait for a run to finish.", MaxContainersPerUser))
+			st.sendError(conn, fmt.Sprintf("Too many concurrent programs (max %d per user). Close other tabs or wait for a run to finish.", MaxContainersPerUser))
 			return
 		}
 	}
@@ -534,7 +535,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 	if !sem.AcquireContext(acquireCtx) {
 		cancelAcquire()
 		decUserContainers(st.userID)
-		sendError(conn, "Service is at capacity right now — please try again in a moment.")
+		st.sendError(conn, "Service is at capacity right now — please try again in a moment.")
 		return
 	}
 	defer cancelAcquire()
@@ -562,7 +563,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 		} else {
 			errMsg = "Failed to start execution environment: " + err.Error()
 		}
-		sendError(conn, errMsg)
+		st.sendError(conn, errMsg)
 		return
 	}
 
@@ -583,7 +584,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 	defer deleteUserRun(st.userID, sess.ContainerID)
 
 	// Send started message
-	sendMessage(conn, protocol.ServerMessage{Type: "started"})
+	st.sendMessage(conn, protocol.ServerMessage{Type: "started"})
 
 	// Bridge container output → WebSocket
 	outputDone := make(chan struct{})
@@ -602,7 +603,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 					return
 				}
 
-				sendMessage(conn, protocol.ServerMessage{
+				st.sendMessage(conn, protocol.ServerMessage{
 					Type: "output",
 					Data: string(buf[:n]),
 				})
@@ -685,7 +686,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 				return readErr
 			}
 			if len(files) > 0 || len(folders) > 0 {
-				sendMessage(conn, protocol.ServerMessage{
+				st.sendMessage(conn, protocol.ServerMessage{
 					Type:    "files",
 					Files:   files,
 					Folders: folders,
@@ -713,7 +714,7 @@ func handleRunMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg *
 			msg := "Program crashed unexpectedly"
 			exitMsg.Message = msg
 		}
-		sendMessage(conn, exitMsg)
+		st.sendMessage(conn, exitMsg)
 
 		// Cleanup container
 		st.mu.Lock()
@@ -775,12 +776,12 @@ func handleWriteMessage(conn *websocket.Conn, docker *executor.DockerClient, st 
 	st.mu.Unlock()
 
 	if s == nil {
-		sendError(conn, "No active container — run code first")
+		st.sendError(conn, "No active container — run code first")
 		return
 	}
 
 	if msg.Path == "" {
-		sendError(conn, "path is required for write")
+		st.sendError(conn, "path is required for write")
 		return
 	}
 
@@ -788,20 +789,20 @@ func handleWriteMessage(conn *websocket.Conn, docker *executor.DockerClient, st 
 	pathClean := strings.TrimPrefix(msg.Path, "/")
 	pathClean = strings.TrimPrefix(pathClean, "./")
 	if strings.Contains(pathClean, "..") {
-		sendError(conn, "invalid path")
+		st.sendError(conn, "invalid path")
 		return
 	}
 	// Ensure the resolved path stays under /code
 	resolvedPath := "/code/" + pathClean
 	if resolvedPath == "/code/" || strings.HasPrefix(resolvedPath, "/code/../") {
-		sendError(conn, "invalid path")
+		st.sendError(conn, "invalid path")
 		return
 	}
 
 	// Write the file into the container via exec
 	err := docker.WriteFileToContainer(context.Background(), s.ContainerID, pathClean, msg.Data)
 	if err != nil {
-		sendError(conn, "Failed to write file: "+err.Error())
+		st.sendError(conn, "Failed to write file: "+err.Error())
 		return
 	}
 
@@ -816,17 +817,17 @@ func handleReadFilesMessage(conn *websocket.Conn, docker *executor.DockerClient,
 	st.mu.Unlock()
 
 	if s == nil {
-		sendError(conn, "No active container")
+		st.sendError(conn, "No active container")
 		return
 	}
 
 	files, folders, err := docker.ReadFilesFromContainer(context.Background(), s.ContainerID)
 	if err != nil {
-		sendError(conn, "Failed to read files: "+err.Error())
+		st.sendError(conn, "Failed to read files: "+err.Error())
 		return
 	}
 
-	sendMessage(conn, protocol.ServerMessage{
+	st.sendMessage(conn, protocol.ServerMessage{
 		Type:    "files",
 		Files:   files,
 		Folders: folders,
@@ -869,7 +870,7 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 	shellAcquireCtx, cancelShellAcquire := context.WithTimeout(context.Background(), 45*time.Second)
 	if !sem.AcquireContext(shellAcquireCtx) {
 		cancelShellAcquire()
-		sendError(conn, "Service is at capacity right now — please try again in a moment.")
+		st.sendError(conn, "Service is at capacity right now — please try again in a moment.")
 		return
 	}
 	defer cancelShellAcquire()
@@ -878,7 +879,7 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 	if err != nil {
 		sem.Release()
 		log.Printf("[ws] shell creation failed: %v", err)
-		sendError(conn, "Failed to create shell: "+err.Error())
+		st.sendError(conn, "Failed to create shell: "+err.Error())
 		return
 	}
 
@@ -902,7 +903,7 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 			return
 		}
 		log.Printf("[ws] shell idle for %s, killing container (gen=%d)", shellIdleTimeout, gen)
-		sendMessage(conn, protocol.ServerMessage{
+		st.sendMessage(conn, protocol.ServerMessage{
 			Type: "output",
 			Data: "\r\n\x1b[33m[Shell closed after 10 minutes of inactivity — press Enter to reconnect]\x1b[0m\r\n",
 		})
@@ -910,7 +911,7 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 	})
 
 	// Send started message
-	sendMessage(conn, protocol.ServerMessage{Type: "started"})
+	st.sendMessage(conn, protocol.ServerMessage{Type: "started"})
 
 	// Bridge container output → WebSocket
 	outputDone := make(chan struct{})
@@ -929,7 +930,7 @@ func handleShellMessage(conn *websocket.Conn, docker *executor.DockerClient, cfg
 					return
 				}
 
-				sendMessage(conn, protocol.ServerMessage{
+				st.sendMessage(conn, protocol.ServerMessage{
 					Type: "output",
 					Data: string(buf[:n]),
 				})
@@ -996,23 +997,18 @@ func TriggerShutdown(docker *executor.DockerClient) {
 	})
 }
 
-// connWriteMu serializes ALL writes to a WebSocket connection.
-//
-// gorilla/websocket forbids concurrent writers: multiple goroutines call
-// sendMessage on the same conn (the main message loop sending errors/acks,
-// the run output bridge, the shell output bridge, and exit notifications).
-// Without this mutex, two simultaneous writes panic "concurrent write to
-// websocket connection" — under load this was killing whole sessions.
-var connWriteMu sync.Mutex
+// Note: we use sessionState.writeMu to serialize writes to the WebSocket connection.
+// gorilla/websocket forbids concurrent writers on the same conn.
 
-func sendMessage(conn *websocket.Conn, msg protocol.ServerMessage) {
-	connWriteMu.Lock()
-	defer connWriteMu.Unlock()
+func (st *sessionState) sendMessage(conn *websocket.Conn, msg protocol.ServerMessage) {
+	st.writeMu.Lock()
+	defer st.writeMu.Unlock()
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	conn.WriteJSON(msg)
 }
 
-func sendError(conn *websocket.Conn, message string) {
-	sendMessage(conn, protocol.ServerMessage{
+func (st *sessionState) sendError(conn *websocket.Conn, message string) {
+	st.sendMessage(conn, protocol.ServerMessage{
 		Type:    "error",
 		Message: message,
 	})
