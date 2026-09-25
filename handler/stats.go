@@ -9,7 +9,7 @@ import (
 )
 
 // Stats returns service metrics, protected by STATS_KEY.
-func Stats(sem *executor.Semaphore, pool *executor.Pool) http.HandlerFunc {
+func Stats(sem *executor.Semaphore, shellSem *executor.Semaphore, pool *executor.Pool) http.HandlerFunc {
 	statsKey := os.Getenv("STATS_KEY")
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -31,6 +31,9 @@ func Stats(sem *executor.Semaphore, pool *executor.Pool) http.HandlerFunc {
 			"containers_running":   sem.Current(),
 			"containers_available": sem.Available(),
 			"containers_queue":     sem.QueueLen(),
+			"shells_running":       shellSem.Current(),
+			"shells_available":     shellSem.Available(),
+			"shells_queue":         shellSem.QueueLen(),
 			"pool":                 pool.Stats(),
 			"service":              "modigo-runner",
 		})

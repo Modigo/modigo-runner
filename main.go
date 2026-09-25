@@ -34,7 +34,7 @@ func main() {
 	log.Printf("Memory Limit:  %s", cfg.MaxMemory)
 	log.Printf("CPU Quota:     %d/%d", cfg.CPUQuota, cfg.CPUPeriod)
 	log.Printf("Pool Size:     %d", cfg.PoolSize)
-	log.Printf("Max Concurrent:%d containers", cfg.MaxConcurrent)
+	log.Printf("Max Concurrent:%d run containers, %d shell containers", cfg.MaxConcurrent, cfg.MaxConcurrentShells)
 	log.Printf("Auth:          %v (JWT validation with Laravel)", cfg.HasAuth())
 
 	// Initialize Docker client
@@ -65,8 +65,11 @@ func main() {
 		labMgr.CleanupOrphanedLabs(context.Background())
 	}
 
-	// Concurrency limiter — max simultaneous Docker containers
+	// Concurrency limiter — max simultaneous code-run Docker containers.
+	// Shell containers get their own separate semaphore so that a classroom
+	// full of open terminals (group assessment) can never starve code runs.
 	containerSem := executor.NewSemaphore(cfg.MaxConcurrent)
+	shellSem := executor.NewSemaphore(cfg.MaxConcurrentShells)
 
 	// Initialize rate limiter
 	limiter := ratelimit.NewLimiter(cfg.RateLimitRPS, cfg.RateLimitDaily) // Pre-warm container pool
@@ -92,11 +95,13 @@ func main() {
 	mux.Handle("/api/v1/run", authMw(ratelimitMiddleware(limiter, http.HandlerFunc(handler.Execute(docker, limiter, containerSem)))))
 	mux.Handle("/api/v1/languages", authMw(http.HandlerFunc(handler.Languages)))
 
-	// WebSocket (JWT required — browser passes token via query param)
-	mux.Handle("/ws/run", authMw(http.HandlerFunc(handler.WebSocketHandler(docker, cfg, containerSem, labMgr))))
+	// WebSocket (JWT required — browser passes token via query param).
+	// shellSem is separate from containerSem so shell containers don't
+	// consume code-execution slots.
+	mux.Handle("/ws/run", authMw(http.HandlerFunc(handler.WebSocketHandler(docker, cfg, containerSem, shellSem, labMgr))))
 
 	// Stats (protected by STATS_KEY for monitoring)
-	mux.HandleFunc("/stats", handler.Stats(containerSem, pool))
+	mux.HandleFunc("/stats", handler.Stats(containerSem, shellSem, pool))
 
 	// Wrap with CORS + logging
 	wrappedMux := corsMiddleware(cfg)(logMiddleware(mux))

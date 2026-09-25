@@ -215,7 +215,7 @@ type sessionState struct {
 
 // WebSocketHandler handles WS connections for interactive terminal sessions.
 // Auth is already handled by the middleware — this just upgrades and runs.
-func WebSocketHandler(docker *executor.DockerClient, cfg *config.Config, sem *executor.Semaphore, labMgr *executor.LabManager) http.HandlerFunc {
+func WebSocketHandler(docker *executor.DockerClient, cfg *config.Config, sem *executor.Semaphore, shellSem *executor.Semaphore, labMgr *executor.LabManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Panic isolation: a panic in any per-connection path (malformed
 		// message, race in pool/container code, etc.) used to unwind past the
@@ -279,12 +279,12 @@ func WebSocketHandler(docker *executor.DockerClient, cfg *config.Config, sem *ex
 		}()
 
 		// Main message loop
-		handleWebSocketSession(conn, docker, cfg, sem, labMgr, userID)
+		handleWebSocketSession(conn, docker, cfg, sem, shellSem, labMgr, userID)
 	}
 }
 
 // handleWebSocketSession processes messages for a single WebSocket connection.
-func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient, cfg *config.Config, sem *executor.Semaphore, labMgr *executor.LabManager, userID string) {
+func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient, cfg *config.Config, sem *executor.Semaphore, shellSem *executor.Semaphore, labMgr *executor.LabManager, userID string) {
 	st := &sessionState{userID: userID}
 
 	// Cleanup function — called when the WebSocket closes
@@ -355,7 +355,10 @@ func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient,
 			handleLabStop(conn, st, labMgr)
 
 		case "shell":
-			handleShellMessage(conn, docker, cfg, st, &msg, sem)
+			// Shells use their own semaphore so they never consume slots
+			// from the code-run pool — crucial for group assessments where
+			// every student has the terminal open simultaneously.
+			handleShellMessage(conn, docker, cfg, st, &msg, shellSem)
 
 		case "write":
 			handleWriteMessage(conn, docker, st, &msg)
@@ -373,6 +376,7 @@ func handleWebSocketSession(conn *websocket.Conn, docker *executor.DockerClient,
 		}
 	}
 }
+
 
 // handleLabStart creates an isolated Docker lab with a target container.
 // The student's next "run" message will create their code container on the lab network.

@@ -9,20 +9,21 @@ import (
 
 // Config holds all configuration for the runner service.
 type Config struct {
-	Port           int
-	DockerSocket   string
-	ImagePrefix    string
-	ExecTimeout    time.Duration
-	MaxMemory      string // Docker format, e.g. "256m"
-	CPUPeriod      int64
-	CPUQuota       int64
-	MaxPID         int
-	AllowedOrigins []string
-	PoolSize       int
-	MaxConcurrent  int 
-	RateLimitRPS   int
-	RateLimitDaily int
-	AuthSecret string
+	Port                int
+	DockerSocket        string
+	ImagePrefix         string
+	ExecTimeout         time.Duration
+	MaxMemory           string // Docker format, e.g. "256m"
+	CPUPeriod           int64
+	CPUQuota            int64
+	MaxPID              int
+	AllowedOrigins      []string
+	PoolSize            int
+	MaxConcurrent       int // max simultaneous code-run containers
+	MaxConcurrentShells int // max simultaneous interactive shell containers (separate pool)
+	RateLimitRPS        int
+	RateLimitDaily      int
+	AuthSecret          string
 }
 
 
@@ -56,6 +57,7 @@ func loadEnvFile() {
 
 func Load() *Config {
 	loadEnvFile()
+	maxConcurrent := getEnvInt("MAX_CONCURRENT", 50)
 	cfg := &Config{
 		Port:           getEnvInt("PORT", 8080),
 		DockerSocket:   getEnvStr("DOCKER_SOCKET", "/var/run/docker.sock"),
@@ -67,10 +69,14 @@ func Load() *Config {
 		MaxPID:         getEnvInt("MAX_PID", 64),
 		AllowedOrigins: getEnvCSV("ALLOWED_ORIGINS", []string{"*"}),
 		PoolSize:       getEnvInt("POOL_SIZE", 3),
-		MaxConcurrent:  getEnvInt("MAX_CONCURRENT", 50),
-		RateLimitRPS:   getEnvInt("RATE_LIMIT_RPS", 10),
-		RateLimitDaily: getEnvInt("RATE_LIMIT_DAILY", 10000),
-		AuthSecret:     getEnvStr("AUTH_SECRET", ""),
+		MaxConcurrent:  maxConcurrent,
+		// Shells are long-lived but idle — give them their own independent pool
+		// so a classroom full of open terminals can't starve the run semaphore.
+		// Default: same as MaxConcurrent (one shell slot per potential user).
+		MaxConcurrentShells: getEnvInt("MAX_CONCURRENT_SHELLS", maxConcurrent),
+		RateLimitRPS:        getEnvInt("RATE_LIMIT_RPS", 10),
+		RateLimitDaily:      getEnvInt("RATE_LIMIT_DAILY", 10000),
+		AuthSecret:          getEnvStr("AUTH_SECRET", ""),
 	}
 	return cfg
 }
