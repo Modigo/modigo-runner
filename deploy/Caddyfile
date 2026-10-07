@@ -38,6 +38,15 @@ runner.modigo.online {
         -Server
     }
 
+    # Embeddable guest assessment pages may be framed by any origin.
+    # Must override both the global X-Frame-Options DENY above and set
+    # a permissive CSP frame-ancestors (CSP wins over X-Frame-Options
+    # in modern browsers when both are present).
+    header /embed/* {
+        X-Frame-Options ""
+        Content-Security-Policy "frame-ancestors *"
+    }
+
     # Logging
     log {
         output file /var/log/caddy/runner.log {
