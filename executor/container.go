@@ -523,7 +523,11 @@ HISTCONTROL=ignoredups
 	memLimit, cpuPeriod, cpuQuota, pidsLimit := d.limitsForLang(lang)
 	networkMode := "none"
 	if labNetworkID != "" {
-		networkMode = "container:" + labNetworkID
+		// Join the lab network directly (Docker accepts a network ID in
+		// NetworkMode). The old "container:" prefix expected a CONTAINER id
+		// and always failed with "joining network namespace ... No such
+		// container", so shells could never reach lab targets.
+		networkMode = labNetworkID
 	}
 	hostCfg := &container.HostConfig{
 		Resources: container.Resources{

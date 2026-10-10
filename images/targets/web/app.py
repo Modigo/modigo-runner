@@ -3,9 +3,31 @@ from flask import Flask, request, render_template_string, redirect, url_for, jso
 import sqlite3
 import os
 import subprocess
+import hashlib
 
 app = Flask(__name__)
 DB_PATH = "/tmp/users.db"
+
+# ── Scenario mode ─────────────────────────────────────────────────────────────
+# When the platform starts a lab with TARGET_SEED + TARGET_FLAG, the app:
+#   1. plants the per-instance flag wherever the vulnerabilities lead
+#      (admin panel, admin's DB secret via SQLi/IDOR),
+#   2. randomizes the admin panel path from the seed — the tour on the index
+#      page no longer lists it, so learners must enumerate (gobuster) or dump
+#      the DB to find it,
+#   3. keeps everything else identical so the same lessons still apply.
+# Without those env vars the app behaves exactly as before (static lab mode).
+SEED = os.environ.get("TARGET_SEED", "")
+FLAG = os.environ.get("TARGET_FLAG", "")
+SCENARIO_MODE = bool(SEED and FLAG)
+
+
+def _derive(part: str, n: int = 4) -> str:
+    h = hashlib.sha256(f"{SEED}|{part}".encode()).hexdigest()
+    return h[:n]
+
+
+ADMIN_PATH = f"admin-{_derive('admin')}" if SCENARIO_MODE else "admin"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -18,12 +40,14 @@ def init_db():
         role TEXT DEFAULT 'user',
         secret TEXT DEFAULT 'FLAG{you_found_the_secret_data}'
     )''')
-    # Insert some users
+    # Insert some users. The admin's secret is where the flag is planted —
+    # reachable via SQLi login bypass, SQLi search dump, or the IDOR profile.
     try:
-        c.executemany("INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)", [
-            ("admin", "admin123", "admin@vulnerable.local", "admin"),
-            ("alice", "password1", "alice@vulnerable.local", "user"),
-            ("bob", "qwerty", "bob@vulnerable.local", "user"),
+        c.executemany("INSERT INTO users (username, password, email, role, secret) VALUES (?, ?, ?, ?, ?)", [
+            ("admin", "admin123", "admin@vulnerable.local", "admin",
+             FLAG or "FLAG{you_found_the_secret_data}"),
+            ("alice", "password1", "alice@vulnerable.local", "user", "no secrets here"),
+            ("bob", "qwerty", "bob@vulnerable.local", "user", "no secrets here"),
         ])
         conn.commit()
     except sqlite3.IntegrityError:
@@ -32,27 +56,33 @@ def init_db():
 
 @app.route("/")
 def index():
-    return render_template_string("""
-    <h1>🏦 VulnBank - Online Banking</h1>
-    <p>Welcome to VulnBank. This is an intentionally vulnerable application.</p>
+    # Scenario mode hides the guided tour and the admin link — learners must
+    # enumerate the site themselves to find the admin panel.
+    tour = "" if SCENARIO_MODE else """
     <ul>
-        <li><a href="/login">Login</a></li>
-        <li><a href="/search">Search Users</a></li>
-        <li><a href="/profile/1">View Profile (IDOR)</a></li>
         <li><a href="/admin">Admin Panel</a></li>
-        <li><a href="/ping">Network Tools</a></li>
-        <li><a href="/read?file=README">Read File</a></li>
     </ul>
     <h3>Vulnerabilities to Find:</h3>
     <ol>
         <li>SQL Injection on the login page</li>
         <li>SQL Injection on the search page</li>
         <li>Cross-Site Scripting (XSS)</li>
-        <li>Command Injection on the ping tool</li>
-        <li>Path Traversal on the file reader</li>
+        <li>Command Injection on the ping tool</li>        <li>Path Traversal on the file reader</li>
         <li>IDOR on user profiles</li>
     </ol>
-    """)
+    """
+    return render_template_string("""
+    <h1>🏦 VulnBank - Online Banking</h1>
+    <p>Welcome to VulnBank. This is an intentionally vulnerable application.</p>
+    <ul>
+        <li><a href="/login">Login</a></li>
+        <li><a href="/search">Search Users</a></li>
+        <li><a href="/profile/1">View Profile</a></li>
+        <li><a href="/ping">Network Tools</a></li>
+        <li><a href="/read?file=README">Read File</a></li>
+    </ul>
+    {{ tour|safe }}
+    """, tour=tour)
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -137,17 +167,23 @@ def profile(user_id):
     return jsonify({"error": "User not found"}), 404
 
 @app.route("/admin")
+@app.route("/" + ADMIN_PATH)
 def admin():
+    # In scenario mode the plain /admin route is dead — only the seeded path
+    # (found via enumeration) reaches the panel.
+    if SCENARIO_MODE and request.path == "/admin":
+        return jsonify({"error": "Not found"}), 404
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, username, email, role FROM users")
     users = c.fetchall()
     conn.close()
-    
+
     return jsonify({
         "message": "Welcome to Admin Panel",
         "users": [{"id": u[0], "username": u[1], "email": u[2], "role": u[3]} for u in users],
-        "flag": "FLAG{admin_panel_accessed_without_auth}"
+        "flag": FLAG or "FLAG{admin_panel_accessed_without_auth}"
     })
 
 @app.route("/ping")
