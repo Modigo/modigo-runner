@@ -1,37 +1,47 @@
-FROM debian:bookworm-slim
+FROM python:3.12-slim
 
-# Install security tools, compilers, and language runtimes
+# Cybersecurity practice toolbox.
+#
+# This image is both the learner's shell ("practice box") and the execution
+# environment for cyber lessons. Deliberately lean: enumeration, web testing,
+# brute-force, and offline cracking only. No Metasploit — the pedagogy is
+# that learners write their own exploits (guided by lessons), not spray
+# frameworks at targets.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Network tools
-    nmap netcat-openbsd socat tcpdump iputils-ping \
-    # Web tools
-    curl wget \
-    # Crypto / SSL
-    openssl \
-    # Debugging
-    gdb strace ltrace \
-    # Compilers + runtimes
-    gcc g++ make cmake \
-    python3 python3-pip python3-venv \
-    default-jdk \
-    golang-go \
-    # Binary analysis + hex
-    binutils file bsdmainutils \
-    # Text processing
-    jq grep sed gawk \
-    # Process / system
-    procps \
-    # Clean up
+    # Enumeration / scanning
+    nmap \
+    dnsutils \
+    whois \
+    # Web content discovery / injection
+    # (no nikto — not packaged in Debian; gobuster/sqlmap cover web enum)
+    gobuster \
+    sqlmap \
+    # Brute force
+    hydra \
+    # Offline cracking
+    john \
+    # Swiss-army networking
+    curl \
+    wget \
+    netcat-openbsd \
+    socat \
+    # File / hex / payload work
+    xxd \
+    file \
+    less \
+    vim-tiny \
+    git \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python security packages
-RUN pip3 install --break-system-packages \
-    scapy requests flask
+# Python libraries for writing your own tooling — the "write it" tier:
+# learners script scanners and exploit helpers instead of only running tools.
+RUN pip install --no-cache-dir \
+    requests \
+    beautifulsoup4 \
+    scapy \
+    pwntools
 
-# Create a non-root user for running challenges
-RUN useradd -m -s /bin/bash student
-WORKDIR /home/student
+WORKDIR /code
 
-# Default: drop to bash as student
-USER student
-CMD ["/bin/bash"]
+CMD ["bash"]

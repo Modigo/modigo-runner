@@ -169,6 +169,7 @@ docker build -t modigo-runner-java        -f images/java/Dockerfile        image
 docker build -t modigo-runner-rust        -f images/rust/Dockerfile        images/rust/
 docker build -t modigo-runner-php         -f images/php/Dockerfile         images/php/
 docker build -t modigo-runner-cyber       -f images/cyber/Dockerfile       images/cyber/
+docker build -t modigo-runner-cyber       -f images/cyber/Dockerfile       images/cyber/
 
 # Database targets (if using lab/database exercises)
 docker build -t modigo-runner-target-postgres -f images/targets/postgres/Dockerfile images/targets/postgres/
