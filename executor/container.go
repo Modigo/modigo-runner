@@ -556,14 +556,10 @@ HISTCONTROL=ignoredups
 	}
 	containerID := resp.ID
 
-	// Start the container
-	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		d.Remove(context.Background(), containerID)
-		cancel()
-		return nil, fmt.Errorf("container start: %w", err)
-	}
-
-	// Attach to the container for PTY I/O
+	// Attach to the container for PTY I/O BEFORE starting it. Docker's attach
+	// does not replay output emitted before the attach, and bash prints its
+	// prompt immediately on startup — attaching after start raced bash and
+	// silently swallowed the initial prompt (empty terminal after "started").
 	attachResp, err := d.client.ContainerAttach(ctx, containerID, container.AttachOptions{
 		Stream: true,
 		Stdin:  true,
@@ -574,6 +570,14 @@ HISTCONTROL=ignoredups
 		d.Remove(context.Background(), containerID)
 		cancel()
 		return nil, fmt.Errorf("container attach: %w", err)
+	}
+
+	// Start the container
+	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		attachResp.Close()
+		d.Remove(context.Background(), containerID)
+		cancel()
+		return nil, fmt.Errorf("container start: %w", err)
 	}
 
 	log.Printf("[container] shell started (lang=%s, id=%s)", lang, containerID[:12])
