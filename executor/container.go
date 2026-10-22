@@ -560,10 +560,24 @@ HISTCONTROL=ignoredups
 	}
 	containerID := resp.ID
 
-	// Attach to the container for PTY I/O BEFORE starting it. Docker's attach
-	// does not replay output emitted before the attach, and bash prints its
-	// prompt immediately on startup — attaching after start raced bash and
-	// silently swallowed the initial prompt (empty terminal after "started").
+	// Start the container first, then attach for PTY I/O.
+	//
+	// IMPORTANT: For TTY=true containers, ContainerAttach MUST be called AFTER
+	// ContainerStart. When attach is called on a container that hasn't started yet,
+	// Docker wraps the stream in a multiplexed framing format (8-byte headers:
+	// [stream_type][0][0][0][size×4]) even for TTY containers. Once the container
+	// starts, the format switches to raw PTY — but the bufio.Reader in attachResp
+	// has already buffered those framing bytes, corrupting all subsequent PTY output.
+	// This caused the `workspace:/$ ` prompt to be silently consumed.
+	//
+	// The frontend's 'started' handler already sends `\r` to force bash to re-render
+	// the prompt, so no initial output is lost.
+	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		d.Remove(context.Background(), containerID)
+		cancel()
+		return nil, fmt.Errorf("container start: %w", err)
+	}
+
 	attachResp, err := d.client.ContainerAttach(ctx, containerID, container.AttachOptions{
 		Stream: true,
 		Stdin:  true,
@@ -574,14 +588,6 @@ HISTCONTROL=ignoredups
 		d.Remove(context.Background(), containerID)
 		cancel()
 		return nil, fmt.Errorf("container attach: %w", err)
-	}
-
-	// Start the container
-	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		attachResp.Close()
-		d.Remove(context.Background(), containerID)
-		cancel()
-		return nil, fmt.Errorf("container start: %w", err)
 	}
 
 	log.Printf("[container] shell started (lang=%s, id=%s)", lang, containerID[:12])
@@ -670,6 +676,15 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 		containerCfg.Cmd = []string{"php", mainFile}
 	}
 
+	// The cyber image's default CMD is an interactive shell (see images/cyber/
+	// Dockerfile). Left alone it starts bash, reads the closed stdin and exits 0
+	// without ever touching the submitted file — every "Try It Now" cyber
+	// exercise reported Exit 0 with no output. Always run the entry file
+	// explicitly; LanguageToMainFile maps cyber -> main.py.
+	if isCyberLang(req.Language) {
+		containerCfg.Cmd = []string{"python3", mainFile}
+	}
+
 	// Resource limits
 	// SECURITY (CVE-1): /code is NOT a host bind-mount (files go in via the tar
 	// API below). We keep it in the container layer rather than tmpfs — see the
@@ -712,11 +727,11 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 		return nil, fmt.Errorf("copy files to container: %w", err)
 	}
 
-	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return nil, fmt.Errorf("container start: %w", err)
-	}
-
-	// Attach to pipe stdin
+	// Attach BEFORE start, matching CreateInteractive. The config sets
+	// StdinOnce, so Docker closes stdin at start when no client is attached —
+	// attaching afterwards latched onto an already-dead pipe and every program
+	// that called input()/read() saw an immediate EOF, regardless of the stdin
+	// we were handed.
 	attachResp, err := d.client.ContainerAttach(ctx, containerID, container.AttachOptions{
 		Stream: true,
 		Stdin:  true,
@@ -727,15 +742,22 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 		return nil, fmt.Errorf("container attach: %w", err)
 	}
 
-	// Pipe stdin if provided
+	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		attachResp.Close()
+		return nil, fmt.Errorf("container start: %w", err)
+	}
+
+	// Pipe stdin if provided, then close so the program sees EOF rather than
+	// blocking forever. Copying in a goroutine keeps a large payload from
+	// deadlocking against the stdout reader below.
 	if req.Stdin != "" {
 		go func() {
-			defer attachResp.Close()
-			attachResp.Conn.Write([]byte(req.Stdin))
+			defer attachResp.CloseWrite()
+			io.WriteString(attachResp.Conn, req.Stdin)
 		}()
 	} else {
 		// Close stdin so the process knows there's no input
-		attachResp.Conn.Close()
+		attachResp.CloseWrite()
 	}
 
 	// Wait for container to finish
