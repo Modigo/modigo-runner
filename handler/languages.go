@@ -18,6 +18,9 @@ func Languages(w http.ResponseWriter, r *http.Request) {
 			{ID: "go", Name: "Go", Version: "1.22", Extensions: []string{".go"}},
 			{ID: "java", Name: "Java", Version: "Temurin 21", Extensions: []string{".java"}},
 			{ID: "rust", Name: "Rust", Version: "1.82", Extensions: []string{".rs"}},
+			{ID: "php", Name: "PHP", Version: "8.3", Extensions: []string{".php"}},
+			{ID: "laravel", Name: "Laravel (PHP)", Version: "PHP 8.3 + Illuminate 11", Extensions: []string{".php"}},
+			{ID: "csharp", Name: "C#", Version: "Mono 6.12", Extensions: []string{".cs"}},
 		},
 	}
 

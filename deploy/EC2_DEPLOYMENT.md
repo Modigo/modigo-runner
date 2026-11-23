@@ -168,6 +168,8 @@ docker build -t modigo-runner-cpp         -f images/cpp/Dockerfile         image
 docker build -t modigo-runner-java        -f images/java/Dockerfile        images/java/
 docker build -t modigo-runner-rust        -f images/rust/Dockerfile        images/rust/
 docker build -t modigo-runner-php         -f images/php/Dockerfile         images/php/
+docker build -t modigo-runner-csharp      -f images/csharp/Dockerfile      images/csharp/
+docker build -t modigo-runner-laravel     -f images/laravel/Dockerfile     images/laravel/
 docker build -t modigo-runner-cyber       -f images/cyber/Dockerfile       images/cyber/
 docker build -t modigo-runner-cyber       -f images/cyber/Dockerfile       images/cyber/
 

@@ -68,6 +68,10 @@ func (d *DockerClient) LanguageToImage(lang string) string {
 		return d.prefix + "rust"
 	case "php":
 		return d.prefix + "php"
+	case "csharp", "cs", "c#":
+		return d.prefix + "csharp"
+	case "laravel":
+		return d.prefix + "laravel"
 	case "cyber", "cybersecurity":
 		return d.prefix + "cyber"
 	default:
@@ -95,11 +99,31 @@ func LanguageToMainFile(lang string) string {
 		return "main.rs"
 	case "php":
 		return "index.php"
+	case "csharp", "cs", "c#":
+		return "main.cs"
+	case "laravel":
+		return "index.php"
 	case "cyber", "cybersecurity":
 		return "main.py"
 	default:
 		return "main.txt"
 	}
+}
+
+// isPHPLang is true for the plain PHP image and the Laravel one, which is PHP
+// with Laravel's collections and helpers preloaded.
+func isPHPLang(lang string) bool {
+	lang = strings.ToLower(strings.TrimSpace(lang))
+	return lang == "php" || lang == "laravel"
+}
+
+// isJSLang is true for every name the JavaScript (Node.js) image answers to.
+func isJSLang(lang string) bool {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "javascript", "js", "node", "nodejs":
+		return true
+	}
+	return false
 }
 
 // isCyberLang returns true if the language requires network access and elevated resources.
@@ -113,7 +137,7 @@ func isCyberLang(lang string) bool {
 func isCompiledLang(lang string) bool {
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	switch lang {
-	case "go", "golang", "java", "rust", "rs", "c", "cpp", "c++":
+	case "go", "golang", "java", "rust", "rs", "c", "cpp", "c++", "csharp", "cs", "c#":
 		return true
 	}
 	return false
@@ -297,7 +321,7 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 	// PHP's image ships an interactive REPL as its default CMD ("php -a"), which
 	// ignores the injected file entirely — override it to run the entry file
 	// (relative path resolves against WorkingDir=/code).
-	if strings.EqualFold(lang, "php") {
+	if isPHPLang(lang) {
 		containerCfg.Cmd = []string{"php", LanguageToMainFile(lang)}
 	}
 
@@ -672,8 +696,14 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 
 	// PHP's image ships an interactive REPL as its default CMD ("php -a"), which
 	// ignores the provided file entirely — override it to run the entry file.
-	if strings.EqualFold(req.Language, "php") {
+	if isPHPLang(req.Language) {
 		containerCfg.Cmd = []string{"php", mainFile}
+	}
+
+	// The JavaScript image's default CMD runs /code/index.js. Run the file that
+	// was actually sent (game levels send main.js) so it isn't silently missed.
+	if isJSLang(req.Language) {
+		containerCfg.Cmd = []string{"node", mainFile}
 	}
 
 	// The cyber image's default CMD is an interactive shell (see images/cyber/
@@ -1192,6 +1222,10 @@ func (d *DockerClient) createCompileWrapper(codeDir, lang, mainFile string) (str
 	case "rust", "rs":
 		binary = "/tmp/main"
 		script = fmt.Sprintf("#!/bin/sh\ncd /code && rustc %s -o %s && %s\n", mainFile, binary, binary)
+	case "csharp", "cs", "c#":
+		// Mono's compiler: one step, no project file, fast enough for puzzles.
+		binary = "/tmp/main.exe"
+		script = fmt.Sprintf("#!/bin/sh\ncd /code && mcs -nologo -out:%s *.cs && mono %s\n", binary, binary)
 	default:
 		return "", fmt.Errorf("unsupported compiled language: %s", lang)
 	}
@@ -1207,7 +1241,7 @@ func (d *DockerClient) createCompileWrapper(codeDir, lang, mainFile string) (str
 func isCompiled(lang string) bool {
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	switch lang {
-	case "c", "cpp", "c++", "go", "golang", "java", "rust", "rs":
+	case "c", "cpp", "c++", "go", "golang", "java", "rust", "rs", "csharp", "cs", "c#":
 		return true
 	default:
 		return false
