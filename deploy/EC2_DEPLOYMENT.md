@@ -170,6 +170,7 @@ docker build -t modigo-runner-rust        -f images/rust/Dockerfile        image
 docker build -t modigo-runner-php         -f images/php/Dockerfile         images/php/
 docker build -t modigo-runner-csharp      -f images/csharp/Dockerfile      images/csharp/
 docker build -t modigo-runner-laravel     -f images/laravel/Dockerfile     images/laravel/
+docker build -t modigo-runner-react       -f images/react/Dockerfile       images/react/
 docker build -t modigo-runner-cyber       -f images/cyber/Dockerfile       images/cyber/
 docker build -t modigo-runner-cyber       -f images/cyber/Dockerfile       images/cyber/
 

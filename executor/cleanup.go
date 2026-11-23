@@ -30,12 +30,13 @@ func studentContainerFilter(prefix string) filters.Args {
 		f.Add("ancestor", prefix+"php")
 		f.Add("ancestor", prefix+"csharp")
 		f.Add("ancestor", prefix+"laravel")
+		f.Add("ancestor", prefix+"react")
 	}
 	return f
 }
 
 // studentImageLangs are the language image suffixes appended to the image prefix.
-var studentImageLangs = []string{"python", "javascript", "c", "cpp", "go", "java", "rust", "php", "csharp", "laravel"}
+var studentImageLangs = []string{"python", "javascript", "c", "cpp", "go", "java", "rust", "php", "csharp", "laravel", "react"}
 
 // listStudentContainers returns all containers matching the student filter.
 // A single OR-group filter can't be expressed via the label+ancestor combo,

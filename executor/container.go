@@ -72,6 +72,8 @@ func (d *DockerClient) LanguageToImage(lang string) string {
 		return d.prefix + "csharp"
 	case "laravel":
 		return d.prefix + "laravel"
+	case "react", "jsx":
+		return d.prefix + "react"
 	case "cyber", "cybersecurity":
 		return d.prefix + "cyber"
 	default:
@@ -103,6 +105,8 @@ func LanguageToMainFile(lang string) string {
 		return "main.cs"
 	case "laravel":
 		return "index.php"
+	case "react", "jsx":
+		return "App.jsx"
 	case "cyber", "cybersecurity":
 		return "main.py"
 	default:
@@ -115,6 +119,16 @@ func LanguageToMainFile(lang string) string {
 func isPHPLang(lang string) bool {
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	return lang == "php" || lang == "laravel"
+}
+
+// reactRunner compiles a React level's component and prints its HTML (see
+// images/react/run.cjs).
+const reactRunner = "/opt/react/run.cjs"
+
+// isReactLang is true for React levels, which run in their own image.
+func isReactLang(lang string) bool {
+	lang = strings.ToLower(strings.TrimSpace(lang))
+	return lang == "react" || lang == "jsx"
 }
 
 // isJSLang is true for every name the JavaScript (Node.js) image answers to.
@@ -323,6 +337,9 @@ func (d *DockerClient) CreateInteractive(ctx context.Context, lang, code string,
 	// (relative path resolves against WorkingDir=/code).
 	if isPHPLang(lang) {
 		containerCfg.Cmd = []string{"php", LanguageToMainFile(lang)}
+	}
+	if isReactLang(lang) {
+		containerCfg.Cmd = []string{"node", reactRunner, LanguageToMainFile(lang)}
 	}
 
 	// Host config: resource limits, network mode. /code stays in the container
@@ -704,6 +721,11 @@ func (d *DockerClient) RunNonInteractive(ctx context.Context, req protocol.RESTR
 	// was actually sent (game levels send main.js) so it isn't silently missed.
 	if isJSLang(req.Language) {
 		containerCfg.Cmd = []string{"node", mainFile}
+	}
+
+	// React levels: compile the component and render it with the test's props.
+	if isReactLang(req.Language) {
+		containerCfg.Cmd = []string{"node", reactRunner, mainFile}
 	}
 
 	// The cyber image's default CMD is an interactive shell (see images/cyber/

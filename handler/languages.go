@@ -20,6 +20,7 @@ func Languages(w http.ResponseWriter, r *http.Request) {
 			{ID: "rust", Name: "Rust", Version: "1.82", Extensions: []string{".rs"}},
 			{ID: "php", Name: "PHP", Version: "8.3", Extensions: []string{".php"}},
 			{ID: "laravel", Name: "Laravel (PHP)", Version: "PHP 8.3 + Illuminate 11", Extensions: []string{".php"}},
+			{ID: "react", Name: "React", Version: "React 18 (server render)", Extensions: []string{".jsx"}},
 			{ID: "csharp", Name: "C#", Version: "Mono 6.12", Extensions: []string{".cs"}},
 		},
 	}
