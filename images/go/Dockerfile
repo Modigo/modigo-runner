@@ -5,10 +5,11 @@ ENV GOPROXY=off
 ENV GOSUMDB=off
 ENV GOCACHE=/go-cache
 
-# Pre-warm the Go cache so stdlib (fmt, os, etc.) is already compiled.
-# This cuts cold-start time from ~40s → ~1s under the 0.5 CPU quota.
-RUN printf 'package main\nimport "fmt"\nfunc main() { fmt.Println("warmup") }\n' > /tmp/warmup.go && \
-    go run /tmp/warmup.go && \
-    rm /tmp/warmup.go
+# Pre-warm the Go cache with every stdlib package the curriculum uses
+# (fmt, strings, encoding/json, net/http, httptest, container/heap, ...).
+# Under the run's CPU quota, compiling net/http alone takes over a minute,
+# far past the run timeout; warmed, a run starts in about a second.
+COPY warmup.go /tmp/warmup/main.go
+RUN cd /tmp/warmup && go run main.go && rm -rf /tmp/warmup
 
 CMD ["sh", "-c", "go run main.go 2>&1"]
