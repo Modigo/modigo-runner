@@ -22,6 +22,7 @@ func Languages(w http.ResponseWriter, r *http.Request) {
 			{ID: "laravel", Name: "Laravel (PHP)", Version: "PHP 8.3 + Illuminate 11", Extensions: []string{".php"}},
 			{ID: "react", Name: "React", Version: "React 18 (server render)", Extensions: []string{".jsx"}},
 			{ID: "csharp", Name: "C#", Version: "Mono 6.12", Extensions: []string{".cs"}},
+			{ID: "typescript", Name: "TypeScript", Version: "TypeScript 5.6 on Node 22", Extensions: []string{".ts"}},
 		},
 	}
 

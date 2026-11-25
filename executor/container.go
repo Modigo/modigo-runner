@@ -74,6 +74,8 @@ func (d *DockerClient) LanguageToImage(lang string) string {
 		return d.prefix + "laravel"
 	case "react", "jsx":
 		return d.prefix + "react"
+	case "typescript", "ts":
+		return d.prefix + "typescript"
 	case "cyber", "cybersecurity":
 		return d.prefix + "cyber"
 	default:
@@ -107,6 +109,8 @@ func LanguageToMainFile(lang string) string {
 		return "index.php"
 	case "react", "jsx":
 		return "App.jsx"
+	case "typescript", "ts":
+		return "main.ts"
 	case "cyber", "cybersecurity":
 		return "main.py"
 	default:
@@ -151,7 +155,7 @@ func isCyberLang(lang string) bool {
 func isCompiledLang(lang string) bool {
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	switch lang {
-	case "go", "golang", "java", "rust", "rs", "c", "cpp", "c++", "csharp", "cs", "c#":
+	case "go", "golang", "java", "rust", "rs", "c", "cpp", "c++", "csharp", "cs", "c#", "typescript", "ts":
 		return true
 	}
 	return false
@@ -1248,6 +1252,9 @@ func (d *DockerClient) createCompileWrapper(codeDir, lang, mainFile string) (str
 		// Mono's compiler: one step, no project file, fast enough for puzzles.
 		binary = "/tmp/main.exe"
 		script = fmt.Sprintf("#!/bin/sh\ncd /code && mcs -nologo -out:%s *.cs && mono %s\n", binary, binary)
+	case "typescript", "ts":
+		// Strict type-check, compile to /tmp, run on Node (images/typescript/run.sh).
+		script = fmt.Sprintf("#!/bin/sh\ncd /code && exec sh /opt/ts/run.sh %s\n", mainFile)
 	default:
 		return "", fmt.Errorf("unsupported compiled language: %s", lang)
 	}
@@ -1263,7 +1270,7 @@ func (d *DockerClient) createCompileWrapper(codeDir, lang, mainFile string) (str
 func isCompiled(lang string) bool {
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	switch lang {
-	case "c", "cpp", "c++", "go", "golang", "java", "rust", "rs", "csharp", "cs", "c#":
+	case "c", "cpp", "c++", "go", "golang", "java", "rust", "rs", "csharp", "cs", "c#", "typescript", "ts":
 		return true
 	default:
 		return false
